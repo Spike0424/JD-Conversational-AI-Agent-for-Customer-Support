@@ -27,3 +27,9 @@ class HandoffResponse(BaseModel):
     ticket_id: str
     queue: str
     status: str = "queued"
+
+
+class ErrorResponse(BaseModel):
+    error_code: str
+    message: str
+    trace_id: str | None = None

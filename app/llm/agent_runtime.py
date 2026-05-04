@@ -103,6 +103,11 @@ class ReActQAAgent:
         logger.info("Agent response session_id=%s elapsed_ms=%s", session_id, elapsed_ms)
         return answer
 
+    def get_citations(self, question: str, limit: int = 3) -> list[str]:
+        """Return top retrieval sources for answer traceability."""
+        items = self._rag_index.retrieve(question)
+        return [str(item["source"]) for item in items[: max(0, limit)]]
+
     def ask_stream(self, session_id: str, question: str) -> Iterator[str]:
         started = time.perf_counter()
         logger.info("Streaming request session_id=%s question=%s", session_id, question)

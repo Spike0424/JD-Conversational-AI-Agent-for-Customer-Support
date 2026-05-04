@@ -55,19 +55,31 @@ class RAGIndex:
                     docs.append(Document(page_content=chunk, metadata={"source": rel}))
         return docs
 
+    def retrieve(self, user_query: str) -> list[dict[str, str | float]]:
+        if not self._enabled:
+            return []
+        if not self._vector_store:
+            return []
+
+        matches = self._vector_store.similarity_search_with_score(user_query, k=self._top_k)
+        results: list[dict[str, str | float]] = []
+        for doc, score in matches:
+            source = str(doc.metadata.get("source", "unknown"))
+            snippet = " ".join(doc.page_content.splitlines()[:3]).strip()
+            results.append({"source": source, "score": float(score), "snippet": snippet})
+        return results
+
     def query(self, user_query: str) -> str:
         if not self._enabled:
             return "RAG is disabled."
         if not self._vector_store:
             return "RAG index is empty."
 
-        matches = self._vector_store.similarity_search_with_score(user_query, k=self._top_k)
+        matches = self.retrieve(user_query)
         if not matches:
             return "No relevant context found."
 
         lines = []
-        for doc, score in matches:
-            source = str(doc.metadata.get("source", "unknown"))
-            snippet = " ".join(doc.page_content.splitlines()[:3]).strip()
-            lines.append(f"[{source}] score={score:.4f} | {snippet}")
+        for item in matches:
+            lines.append(f"[{item['source']}] score={float(item['score']):.4f} | {item['snippet']}")
         return "\n".join(lines)
