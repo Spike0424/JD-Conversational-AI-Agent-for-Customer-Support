@@ -57,7 +57,7 @@ class ReActQAAgent:
         )
         tools = []
         if self._settings.enable_business_tools:
-            tools.extend(get_business_tools(self._settings.docs_root, self._rag_index))
+            tools.extend(get_business_tools(self._settings, self._settings.docs_root, self._rag_index))
         if self._settings.enable_dev_tools:
             tools.extend(get_dev_tools())
         if not tools:

@@ -77,6 +77,9 @@ curl -s -X POST http://127.0.0.1:8000/v1/handoff \
 - `ENABLE_BUSINESS_TOOLS=true` enables customer-service business tools (recommended for production).
 - `ENABLE_DEV_TOOLS=false` keeps file/bash developer tools disabled by default.
 - Turn on `ENABLE_DEV_TOOLS=true` only in trusted debugging environments.
+- Business tools return structured JSON with `status/code/data/message`.
+- Configure real backend adapters via `OMS_BASE_URL`, `CRM_BASE_URL`, `AFTERSALE_BASE_URL`.
+- `BUSINESS_API_TIMEOUT_SECONDS` and `BUSINESS_API_RETRIES` control timeout/retry behavior.
 
 ## Notes
 

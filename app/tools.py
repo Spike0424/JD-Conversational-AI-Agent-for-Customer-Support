@@ -3,12 +3,13 @@ import json
 import operator
 import shlex
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from langchain_core.tools import tool
 
+from app.config import Settings
+from app.integrations.business_service import BusinessAPIError, BusinessService
 from app.rag import RAGIndex
 
 ALLOWED_OPERATORS: dict[type, Callable[[float, float], float] | Callable[[float], float]] = {
@@ -173,71 +174,49 @@ def build_rag_search_tool(rag_index: RAGIndex):
     return search_knowledge_base
 
 
-@tool
-def search_products(category: str, budget_min: int = 0, budget_max: int = 99999) -> str:
-    """Search mock 3C product catalog by category and budget range."""
-    catalog = [
-        {"sku": "PHONE-001", "name": "Nebula X1 12+256", "category": "手机", "price": 3299},
-        {"sku": "LAPTOP-002", "name": "FalconBook Pro 14", "category": "笔记本", "price": 6999},
-        {"sku": "PAD-003", "name": "Aurora Pad 11", "category": "平板", "price": 2499},
-        {"sku": "PHONE-004", "name": "Nebula X1 Ultra 16+512", "category": "手机", "price": 4799},
-    ]
-    items = [
-        item
-        for item in catalog
-        if category in item["category"] and budget_min <= item["price"] <= budget_max
-    ]
-    if not items:
-        return "No products found for given constraints."
-    return "\n".join(f"{item['sku']} | {item['name']} | ¥{item['price']}" for item in items)
+def _to_json(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=False)
 
 
-@tool
-def get_order_status(order_id: str) -> str:
-    """Return mock order and logistics status by order ID."""
-    mocked = {
-        "ORDER-1001": {"status": "已发货", "logistics": "顺丰 SF123456789CN", "eta": "2026-05-06"},
-        "ORDER-1002": {"status": "已签收", "logistics": "京东物流 JD987654321", "eta": "2026-05-03"},
-    }
-    order = mocked.get(order_id.strip().upper())
-    if not order:
-        return f"Order {order_id} not found."
-    return json.dumps(order, ensure_ascii=False)
+def get_business_tools(settings: Settings, docs_root: str, rag_index: RAGIndex):
+    service = BusinessService(settings)
 
+    @tool
+    def search_products(category: str, budget_min: int = 0, budget_max: int = 99999) -> str:
+        """Search 3C products through CRM service (with mock fallback)."""
+        try:
+            result = service.search_products(category=category, budget_min=budget_min, budget_max=budget_max)
+            return _to_json(result.to_payload())
+        except BusinessAPIError as exc:
+            return _to_json({"status": "error", "code": exc.code, "message": exc.message})
 
-@tool
-def check_warranty(sn_or_imei: str) -> str:
-    """Check warranty information by serial number or IMEI (mocked)."""
-    token = sn_or_imei.strip().upper()
-    if not token:
-        return "Warranty check error: empty serial/IMEI."
-    warranty = {
-        "token": token,
-        "status": "in_warranty",
-        "valid_until": "2027-12-31",
-        "coverage": "主板、电池、屏幕（非人为）",
-    }
-    return json.dumps(warranty, ensure_ascii=False)
+    @tool
+    def get_order_status(order_id: str) -> str:
+        """Query order and logistics status through OMS service (with mock fallback)."""
+        try:
+            result = service.get_order_status(order_id=order_id)
+            return _to_json(result.to_payload())
+        except BusinessAPIError as exc:
+            return _to_json({"status": "error", "code": exc.code, "message": exc.message})
 
+    @tool
+    def check_warranty(sn_or_imei: str) -> str:
+        """Query product warranty info through after-sale service (with mock fallback)."""
+        try:
+            result = service.check_warranty(sn_or_imei=sn_or_imei)
+            return _to_json(result.to_payload())
+        except BusinessAPIError as exc:
+            return _to_json({"status": "error", "code": exc.code, "message": exc.message})
 
-@tool
-def create_after_sale_ticket(order_id: str, issue_type: str, details: str = "") -> str:
-    """Create a mock after-sales ticket for return/repair/refund."""
-    oid = order_id.strip().upper()
-    issue = issue_type.strip()
-    if not oid or not issue:
-        return "Ticket creation error: order_id and issue_type are required."
-    ticket = {
-        "ticket_id": f"AS-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-        "order_id": oid,
-        "issue_type": issue,
-        "details": details.strip(),
-        "status": "queued",
-    }
-    return json.dumps(ticket, ensure_ascii=False)
+    @tool
+    def create_after_sale_ticket(order_id: str, issue_type: str, details: str = "") -> str:
+        """Create after-sale ticket through after-sale service (with mock fallback)."""
+        try:
+            result = service.create_after_sale_ticket(order_id=order_id, issue_type=issue_type, details=details)
+            return _to_json(result.to_payload())
+        except BusinessAPIError as exc:
+            return _to_json({"status": "error", "code": exc.code, "message": exc.message})
 
-
-def get_business_tools(docs_root: str, rag_index: RAGIndex):
     return [
         calculator,
         build_search_docs_tool(docs_root),
