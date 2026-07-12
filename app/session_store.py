@@ -1,116 +1,76 @@
-import json
-import sqlite3
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+import logging
 
-from redis import Redis
-from redis.exceptions import RedisError
+from app.business_models import AgentMessage
+from app.db import create_session, init_db
 
-from app.config import Settings
-
-
-@dataclass
-class SessionMessage:
-    role: str
-    content: str
+logger = logging.getLogger(__name__)
 
 
 class SessionStore:
-    def __init__(self, settings: Settings) -> None:
-        self._max_messages = settings.max_history_turns * 2
-        self._redis: Redis | None = None
-        self._sqlite_path = self._parse_sqlite_path(settings.database_url)
-        self._init_sqlite()
+    """Session message persistence backed by agent_messages table (SQLModel)."""
 
-        if settings.redis_url.strip():
-            try:
-                client = Redis.from_url(settings.redis_url, decode_responses=True)
-                client.ping()
-                self._redis = client
-            except RedisError:
-                self._redis = None
-
-    @staticmethod
-    def _parse_sqlite_path(database_url: str) -> Path:
-        prefix = "sqlite:///"
-        if not database_url.startswith(prefix):
-            raise ValueError("DATABASE_URL must be sqlite:///path/to/db.sqlite")
-        raw_path = database_url[len(prefix) :]
-        return Path(raw_path).resolve()
-
-    def _init_sqlite(self) -> None:
-        self._sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._sqlite_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS session_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.commit()
-
-    @staticmethod
-    def _redis_key(session_id: str) -> str:
-        return f"agent:session:{session_id}"
+    def __init__(self, max_history_turns: int = 6) -> None:
+        self._max_messages = max_history_turns * 2
+        init_db()
 
     def append(self, session_id: str, role: str, content: str) -> None:
-        if self._redis:
-            try:
-                key = self._redis_key(session_id)
-                self._redis.rpush(key, json.dumps({"role": role, "content": content}))
-                self._redis.ltrim(key, -self._max_messages, -1)
-                return
-            except RedisError:
-                self._redis = None
+        session = create_session()
+        try:
+            msg = AgentMessage(session_id=session_id, role=role, content=content)
+            session.add(msg)
+            session.commit()
 
-        with sqlite3.connect(self._sqlite_path) as conn:
-            conn.execute(
-                "INSERT INTO session_messages (session_id, role, content) VALUES (?, ?, ?)",
-                (session_id, role, content),
-            )
-            conn.execute(
-                """
-                DELETE FROM session_messages
-                WHERE id IN (
-                    SELECT id FROM session_messages
-                    WHERE session_id = ?
-                    ORDER BY id DESC
-                    LIMIT -1 OFFSET ?
+            # Prune excess messages beyond the window
+            if self._max_messages > 0:
+                from sqlalchemy import text
+
+                session.exec(
+                    text(
+                        """
+                        DELETE FROM agent_messages
+                        WHERE id IN (
+                            SELECT id FROM agent_messages
+                            WHERE session_id = :sid
+                            ORDER BY id DESC
+                            OFFSET :max_items
+                        )
+                        """
+                    ),
+                    params={"sid": session_id, "max_items": self._max_messages},
                 )
-                """,
-                (session_id, self._max_messages),
-            )
-            conn.commit()
+                session.commit()
+        finally:
+            session.close()
 
-    def load(self, session_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+    def load(self, session_id: str, limit: int | None = None) -> list[dict[str, str]]:
         max_items = limit or self._max_messages
-
-        if self._redis:
-            try:
-                raw_items = self._redis.lrange(self._redis_key(session_id), -max_items, -1)
-                records = [json.loads(item) for item in raw_items]
-                return [{"role": str(r["role"]), "content": str(r["content"])} for r in records]
-            except RedisError:
-                self._redis = None
-
-        with sqlite3.connect(self._sqlite_path) as conn:
-            cursor = conn.execute(
-                """
-                SELECT role, content FROM (
-                    SELECT role, content, id
-                    FROM session_messages
-                    WHERE session_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                ) sub
-                ORDER BY id ASC
-                """,
-                (session_id, max_items),
+        session = create_session()
+        try:
+            rows = (
+                session.query(AgentMessage)
+                .filter(AgentMessage.session_id == session_id)
+                .order_by(AgentMessage.id.desc())
+                .limit(max_items)
+                .all()
             )
-            return [{"role": row[0], "content": row[1]} for row in cursor.fetchall()]
+            # Reverse to chronological order
+            return [{"role": r.role, "content": r.content or ""} for r in reversed(rows)]
+        finally:
+            session.close()
+
+    def load_last_assistant(self, session_id: str) -> str | None:
+        """Return content of the most recent assistant message for dedup."""
+        session = create_session()
+        try:
+            row = (
+                session.query(AgentMessage)
+                .filter(
+                    AgentMessage.session_id == session_id,
+                    AgentMessage.role == "assistant",
+                )
+                .order_by(AgentMessage.id.desc())
+                .first()
+            )
+            return row.content if row else None
+        finally:
+            session.close()
