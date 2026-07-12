@@ -19,8 +19,16 @@ Then update `.env` with your model provider settings.
 
 ## 3) Start service
 
+FastAPI API service:
+
 ```bash
 uv run uvicorn main:app --reload
+```
+
+Chainlit web chat:
+
+```bash
+uv run chainlit run chainlit_app.py -w --headless
 ```
 
 ## 4) Test endpoints
@@ -52,6 +60,26 @@ curl -N -X POST http://127.0.0.1:8000/chat/stream \
     "question": "总结一下项目里关于 LangChain 的内容"
   }'
 ```
+
+Add document to RAG vector index:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/rag/documents \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source": "faq.md",
+    "content": "这里放需要进入向量库的文档内容"
+  }'
+```
+
+In Chainlit, paste documents with:
+
+```text
+/ingest faq.md
+这里放需要进入向量库的文档内容
+```
+
+Normal Chainlit chat does not build embeddings or touch RAG. Only `/ingest` embeds and stores the provided document text.
 
 Handoff to human agent:
 
@@ -89,6 +117,14 @@ curl -s -X POST http://127.0.0.1:8000/v1/handoff \
   - `trace_id`
 - Streaming (`/chat/stream`) sends `meta` event first with:
   - `trace_id`, `intent`, `citations`, `actions`
+  - each citation item includes `source`, `snippet`, `score`
+
+## Citation traceability
+
+- `/v1/chat` now returns structured citations with `source/snippet/score`.
+- Normal chat does not build embeddings or touch RAG.
+- Use `/rag/documents` or `/v1/rag/documents` to embed user-provided documents into the vector index.
+- The final `answer` appends an `依据来源` section only when the user explicitly requests RAG/knowledge-base retrieval and citations exist.
 
 ## Notes
 
@@ -103,3 +139,5 @@ If you use **DeepSeek** models with **thinking mode** enabled, the API requires 
 `The reasoning_content in the thinking mode must be passed back to the API.`
 
 This project sends `extra_body={"thinking": {"type": "disabled"}}` when `CHAT_THINKING_MODE` is `disabled`, or when it is `auto` and `OPENAI_BASE_URL` points at `deepseek.com`. Set `CHAT_THINKING_MODE=enabled` only if you need visible chain-of-thought and accept that tool-heavy flows may still need provider-specific message handling.
+
+![mock数据](./png/image.png)

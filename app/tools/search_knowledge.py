@@ -1,0 +1,486 @@
+"""Search knowledge base with hybrid retrieval: alias matching + keyword scoring + vector semantic fusion."""
+
+import logging
+import re
+import uuid
+from typing import Optional, Union
+
+import numpy as np
+from pydantic import BaseModel, Field
+
+from app.business_models import (
+    AftersaleKnowledge,
+    InsaleKnowledge,
+    PresaleKnowledge,
+)
+from app.config import SUB_SCENE_RULES, get_settings
+from app.db import create_session
+from app.evaluation.rag_logger import RAGLogger
+from app.retrieval.aftersale_retriever import match_aftersale_exact
+from app.retrieval.embedding import get_embeddings
+from util.agent_tool import agent_tool
+
+logger = logging.getLogger(__name__)
+
+_search_knowledge_description = (
+    "Search the internal knowledge base for after-sales policies, "
+    "product specifications, usage instructions, or shipping information. "
+    "Use this for ANY e-commerce customer service question. "
+    "Results are automatically filtered by the current shop and scene."
+)
+
+_SCENE_TABLE = {
+    "presale": PresaleKnowledge,
+    "insale": InsaleKnowledge,
+    "aftersale": AftersaleKnowledge,
+}
+
+# "mixed" is a virtual scene for clarification prompts — skip DB retrieval
+_SCENE_NO_RETRIEVAL = {"mixed"}
+
+_VECTOR_MATCH_THRESHOLD = 0.45
+_MATCH_TYPE_RULE = "rule"
+_MATCH_TYPE_HYBRID = "hybrid"
+_NON_WORD_RE = re.compile(r"[^\w]")
+_SCENE_LABELS = {"presale": "售前", "insale": "售中", "aftersale": "售后"}
+
+# ── Pydantic param model ──────────────────────────────────────────────
+
+
+class SearchKnowledgeParams(BaseModel):
+    """Unified knowledge search params."""
+
+    query: str = Field(..., description="客户原始问题")
+    shop_id: Union[str, int] = Field(..., description="店铺ID")
+    user_id: Optional[Union[str, int]] = Field(None, description="当前客服账号ID")
+    recipient_uid: Optional[str] = Field(None, description="客户UID")
+    goods_id: Optional[int] = Field(None, description="当前商品ID")
+    scene: Optional[str] = Field(None, description="售前/售中/售后")
+
+
+# ── SearchKnowledge ───────────────────────────────────────────────────
+
+
+class SearchKnowledge:
+    """Hybrid knowledge-base search with alias/keyword/vector scoring.
+
+    Session context (shop_id, scene, goods_id) is set before each LLM
+    invocation so the tool can filter retrieval to the correct shop and scene.
+    """
+
+    def __init__(self) -> None:
+        self._shop_id: int | None = None
+        self._scene: str = "presale"
+        self._goods_id: int | None = None
+        self._settings = get_settings()
+
+    def set_context(
+        self, shop_id: int | None, scene: str = "presale", goods_id: int | None = None
+    ) -> None:
+        self._shop_id = shop_id
+        self._scene = scene
+        self._goods_id = goods_id
+
+    # ── helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_match_text(text: str) -> str:
+        return _NON_WORD_RE.sub("", text.lower().strip())
+
+    # ── alias match scoring (highest weight) ──────────────────────
+
+    def _alias_match_score(self, query_clean: str, aliases: str) -> int:
+        if not query_clean or not aliases:
+            return 0
+
+        best_score = 0
+        for alias in re.split(r"[/|;；\n\r]+", aliases):
+            alias_clean = self._normalize_match_text(alias)
+            if len(alias_clean) < 2:
+                continue
+
+            if alias_clean == query_clean:
+                best_score = max(best_score, 240 + min(len(alias_clean), 30))
+            elif len(alias_clean) >= 4 and alias_clean in query_clean:
+                best_score = max(best_score, 115 + min(len(alias_clean), 12))
+            elif len(query_clean) >= 6 and query_clean in alias_clean:
+                best_score = max(best_score, 80 + min(len(query_clean), 12))
+            elif alias_clean in query_clean or query_clean in alias_clean:
+                best_score = max(best_score, 8 + min(len(alias_clean), 6))
+
+        return best_score
+
+    # ── search-term extraction ────────────────────────────────────
+
+    def _search_terms(self, query: str) -> list[str]:
+        query_lower = query.lower()
+        terms: list[str] = []
+        term_lower_set: set[str] = set()
+
+        for phrase in self._settings.search_phrase_candidates:
+            if phrase.lower() in query_lower:
+                terms.append(phrase)
+                term_lower_set.add(phrase.lower())
+
+        for key, variants in self._settings.search_synonym_expansions.items():
+            if key.lower() in query_lower:
+                for v in variants:
+                    v_lower = v.lower()
+                    if v_lower not in term_lower_set:
+                        terms.append(v)
+                        term_lower_set.add(v_lower)
+
+        return terms
+
+    # ── keyword match scoring (~120 points) ───────────────────────
+
+    def _bm25_like_match_score(self, words: list[str], entry: dict) -> int:
+        if not words:
+            return 0
+
+        text_fields = [
+            entry.get("aliases", ""),
+            entry.get("answer", ""),
+            entry.get("tags", ""),
+            entry.get("product_family", ""),
+            entry.get("section_title", ""),
+        ]
+        text = " ".join(f for f in text_fields if f).lower()
+
+        score = 0
+        for word in words:
+            count = text.count(word.lower())
+            if count > 0:
+                score += min(10 + count * 3, 25)
+        return min(score, 120)
+
+    # ── keyword sub-scorers (TODO: implement per-field matching) ──
+
+    def _parameter_type_match_score(self, query: str, entry: dict) -> int:
+        return 0
+
+    def _version_name_match_score(self, query: str, entry: dict) -> int:
+        return 0
+
+    def _action_type_match_score(self, query: str, entry: dict) -> int:
+        return 0
+
+    def _complaint_type_match_score(self, query: str, entry: dict) -> int:
+        return 0
+
+    def _case_type_match_score(self, query: str, entry: dict) -> int:
+        return 0
+
+    def _keyword_match_score(self, query: str, entry: dict) -> int:
+        words = self._search_terms(query)
+        score = self._parameter_type_match_score(query, entry)
+        score += self._version_name_match_score(query, entry)
+        score += self._action_type_match_score(query, entry)
+        score += self._complaint_type_match_score(query, entry)
+        score += self._case_type_match_score(query, entry)
+        if words:
+            score += self._bm25_like_match_score(words, entry)
+        return score
+
+    # ── intent adjustment ─────────────────────────────────────────
+
+    def _intent_adjustment(self, sub_intent: str | None) -> int:
+        # TODO: weight by sub_intent category when rules are defined
+        return 0
+
+    # ── goods_id consistency ──────────────────────────────────────
+
+    def _goods_id_bonus(self, entry_goods_id: int | None) -> int:
+        if self._goods_id is not None and entry_goods_id == self._goods_id:
+            return 50
+        if entry_goods_id is not None and self._goods_id is not None and entry_goods_id != self._goods_id:
+            return -30
+        return 0
+
+    # ── data fetching ─────────────────────────────────────────────
+
+    def _fetch_candidates(
+        self, shop_id: int, scene: str, goods_id: int | None
+    ) -> list[dict]:
+        """Fetch product-specific + shop-general knowledge in a single query."""
+        table = _SCENE_TABLE.get(scene, PresaleKnowledge)
+        session = create_session()
+        try:
+            from sqlalchemy import or_
+
+            filters = [
+                table.shop_id == shop_id,
+                table.enabled == True,
+            ]
+            if goods_id is not None:
+                filters.append(
+                    or_(table.goods_id == goods_id, table.goods_id.is_(None))
+                )
+            else:
+                filters.append(table.goods_id.is_(None))
+
+            rows = session.query(table).filter(*filters).all()
+
+            candidates: list[dict] = []
+            for row in rows:
+                candidates.append({
+                    "id": row.id,
+                    "goods_id": row.goods_id,
+                    "aliases": row.aliases or "",
+                    "answer": row.answer or "",
+                    "sub_intent": row.sub_intent,
+                    "product_family": row.product_family or "",
+                    "tags": row.tags or "",
+                    "section_title": row.section_title or "",
+                    "priority": row.priority or 0,
+                })
+
+            return candidates
+        except Exception:
+            logger.exception("_fetch_candidates failed shop=%s scene=%s", shop_id, scene)
+            return []
+        finally:
+            session.close()
+
+    # ── vector semantic scoring ───────────────────────────────────
+
+    def _vector_semantic_score(
+        self, query: str, candidates: list[dict]
+    ) -> list[float]:
+        """Batch-embed query + candidates, return cosine similarity per entry."""
+        if not candidates:
+            return []
+
+        try:
+            embeddings = get_embeddings()
+            query_vec = np.array(embeddings.embed_query(query), dtype=np.float32)
+
+            texts = []
+            for entry in candidates:
+                text = entry.get("aliases", "") or entry.get("answer", "")
+                texts.append(text[:2048])
+
+            candidate_vecs = np.array(embeddings.embed_documents(texts), dtype=np.float32)
+
+            query_norm = query_vec / (np.linalg.norm(query_vec) or 1.0)
+            candidate_norms = candidate_vecs / (
+                np.linalg.norm(candidate_vecs, axis=1, keepdims=True) + 1e-10
+            )
+            scores = np.dot(candidate_norms, query_norm)
+
+            return scores.tolist()
+        except Exception:
+            logger.exception("_vector_semantic_score failed, returning zeros")
+            return [0.0] * len(candidates)
+
+    # ── ranking ───────────────────────────────────────────────────
+
+    def _rank(self, query: str, candidates: list[dict]) -> list[dict]:
+        if not candidates:
+            return []
+
+        query_clean = self._normalize_match_text(query)
+
+        results: list[dict] = []
+        vector_scores = self._vector_semantic_score(query, candidates)
+
+        for i, entry in enumerate(candidates):
+            alias_score = self._alias_match_score(query_clean, entry.get("aliases", ""))
+            keyword_score = self._keyword_match_score(query, entry)
+            intent_score = self._intent_adjustment(entry.get("sub_intent"))
+            goods_bonus = self._goods_id_bonus(entry.get("goods_id"))
+            vector_sim = vector_scores[i]
+
+            rule_total = alias_score + keyword_score + intent_score + goods_bonus
+
+            if vector_sim >= _VECTOR_MATCH_THRESHOLD:
+                match_type = _MATCH_TYPE_HYBRID
+                final_score = rule_total + vector_sim * 100
+            else:
+                match_type = _MATCH_TYPE_RULE
+                final_score = rule_total
+
+            results.append({
+                **entry,
+                "alias_score": alias_score,
+                "keyword_score": keyword_score,
+                "intent_score": intent_score,
+                "goods_bonus": goods_bonus,
+                "vector_similarity": round(vector_sim, 4),
+                "match_type": match_type,
+                "final_score": round(final_score, 2),
+            })
+
+        results.sort(key=lambda r: r["final_score"], reverse=True)
+        return results
+
+    # ── sub-scene scoring (kept from original) ────────────────────
+
+    @staticmethod
+    def score_sub_scene(query: str) -> dict[str, int]:
+        query_lower = query.lower()
+        scores: dict[str, int] = {}
+        for scene, keywords in SUB_SCENE_RULES.items():
+            scores[scene] = 1 if any(kw in query_lower for kw in keywords) else -1
+        return scores
+
+    @staticmethod
+    def best_sub_scene(query: str) -> str | None:
+        scores = SearchKnowledge.score_sub_scene(query)
+        best = max(scores, key=lambda k: scores[k])
+        return best if scores[best] > 0 else None
+
+    # ── main search ───────────────────────────────────────────────
+
+    def search(self, query: str, trace_id: str = "") -> str:
+        tid = trace_id or uuid.uuid4().hex[:12]
+        RAGLogger.log_query(tid, query)
+
+        best = self.best_sub_scene(query)
+        logger.info(
+            "Sub-scene best=%s trace=%s shop=%s scene=%s goods=%s",
+            best, tid, self._shop_id, self._scene, self._goods_id,
+        )
+
+        if self._shop_id is None:
+            return "No shop context set. Cannot search knowledge base."
+
+        if self._scene in _SCENE_NO_RETRIEVAL:
+            return ""
+
+        # ── Aftersale fast-path: exact alias match ──
+        if self._scene == "aftersale":
+            exact = match_aftersale_exact(query, self._shop_id, self._goods_id)
+            if exact:
+                return f"[aftersale exact] {exact}"
+
+        # ── Hybrid retrieval ──
+        candidates = self._fetch_candidates(
+            shop_id=self._shop_id,
+            scene=self._scene,
+            goods_id=self._goods_id,
+        )
+
+        if not candidates:
+            label = _SCENE_LABELS.get(self._scene, self._scene)
+            return (
+                f"No {label} knowledge "
+                f"found for shop={self._shop_id} goods={self._goods_id}."
+            )
+
+        ranked = self._rank(query, candidates)
+
+        # ── Format results ──
+        lines: list[str] = []
+        top_n = min(len(ranked), 5)
+        for i, r in enumerate(ranked[:top_n]):
+            tag = (
+                f"[{r['match_type']}]"
+                if r["match_type"] == _MATCH_TYPE_HYBRID
+                else f"[{_MATCH_TYPE_RULE}]"
+            )
+            lines.append(
+                f"{tag} #{i + 1} score={r['final_score']:.1f} "
+                f"(alias={r['alias_score']} kw={r['keyword_score']} "
+                f"vec={r['vector_similarity']:.3f}) "
+                f"goods_id={r['goods_id']}\n"
+                f"  aliases: {r['aliases']}\n"
+                f"  answer: {r['answer'][:300]}"
+            )
+
+        header = f"[sub_scene={best} | {self._scene}] {len(ranked)} candidates, showing top {top_n}"
+
+        # ── Structured RAG trace log ──
+        retrieval_hit = len(ranked) > 0 and ranked[0]["final_score"] > 0
+        RAGLogger.log_trace(
+            tid,
+            phase="retrieval",
+            user_query=query,
+            scene=self._scene,
+            shop_id=self._shop_id,
+            goods_id=self._goods_id,
+            filters={"shop_id": self._shop_id, "goods_id": self._goods_id, "scene": self._scene},
+            top_k=min(len(ranked), 5),
+            retrieved_chunks=[
+                {"source": r.get("aliases", ""), "score": r.get("final_score", 0), "snippet": r.get("answer", "")[:200]}
+                for r in ranked[:5]
+            ],
+            rerank_result=[
+                {"rank": i + 1, "source": r.get("aliases", ""),
+                 "match_type": r.get("match_type", ""), "final_score": r.get("final_score", 0),
+                 "alias_score": r.get("alias_score", 0), "keyword_score": r.get("keyword_score", 0),
+                 "vector_similarity": r.get("vector_similarity", 0)}
+                for i, r in enumerate(ranked[:5])
+            ],
+            retrieval_hit=retrieval_hit,
+        )
+
+        return header + "\n\n" + "\n\n".join(lines)
+
+    def search_structured(self, query: str) -> list[dict]:
+        """Return structured ranked results for eval (no formatted text)."""
+        if self._shop_id is None:
+            return []
+        if self._scene in _SCENE_NO_RETRIEVAL:
+            return []
+
+        candidates = self._fetch_candidates(
+            shop_id=self._shop_id,
+            scene=self._scene,
+            goods_id=self._goods_id,
+        )
+        if not candidates:
+            return []
+
+        ranked = self._rank(query, candidates)
+        results = []
+        for r in ranked:
+            results.append({
+                "source": r.get("aliases", ""),
+                "score": r.get("final_score", 0),
+                "snippet": r.get("answer", "")[:300],
+            })
+        return results
+
+
+# ── singleton ─────────────────────────────────────────────────────────
+
+_search_knowledge_instance: SearchKnowledge | None = None
+
+
+def set_search_knowledge(instance: SearchKnowledge) -> None:
+    global _search_knowledge_instance
+    _search_knowledge_instance = instance
+
+
+def get_search_knowledge() -> SearchKnowledge | None:
+    return _search_knowledge_instance
+
+
+# ── tool registration ─────────────────────────────────────────────────
+
+
+@agent_tool(
+    name="search_knowledge",
+    description=_search_knowledge_description,
+    param_model=SearchKnowledgeParams,
+)
+def search_knowledge(**kwargs: object) -> str:
+    if _search_knowledge_instance is None:
+        return "search_knowledge is not initialized."
+
+    params = SearchKnowledgeParams(**{k: v for k, v in kwargs.items() if v is not None})
+
+    if params.shop_id:
+        try:
+            sid = int(params.shop_id) if isinstance(params.shop_id, str) else int(params.shop_id)
+        except (ValueError, TypeError):
+            sid = None
+        if sid is not None:
+            _search_knowledge_instance.set_context(
+                shop_id=sid,
+                scene=params.scene or "presale",
+                goods_id=params.goods_id,
+            )
+
+    return _search_knowledge_instance.search(params.query)

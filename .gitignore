@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment
+.env
+
+# RAG vector index
+.rag/
+
+# Database
+*.db
+
+# IDE
+.vscode/
+.cursor/
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+*.swp
+*.swo
+
+# Claude Code 本地/会话配置
+.claude/
+
+# Chainlit 缓存
+.chainlit/
+
+# Claude agent skills 缓存
+.agents/
+
+# 运行日志
+logs/
+
+# ZOL 浏览器爬虫
+script/
+
+# 截图/调试图片
+png/
+
+# 原始数据集（~1GB JD CSV + 自带 .git）
+datasheet/
+
+# Node（如果将来加前端）
+node_modules/
+
+# 售后政策文件
+doc/
