@@ -5,8 +5,6 @@ from typing import Optional
 
 from sqlmodel import Field, SQLModel
 
-from app.db import create_session, init_db
-
 
 class RagChunk(SQLModel, table=True):
     __tablename__ = "rag_chunks"
