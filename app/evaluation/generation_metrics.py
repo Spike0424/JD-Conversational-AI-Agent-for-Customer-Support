@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
 import re
@@ -11,6 +10,15 @@ from app.config import get_settings
 from app.evaluation.schemas import GenerationEvalResult, RetrievedDoc
 
 logger = logging.getLogger(__name__)
+
+_MAX_SNIPPET_CHARS = 1500
+
+# Justifications produced when the judge output could not be parsed or the LLM call failed.
+# Used to detect non-real scores so they can be tracked separately from real 1-5 ratings.
+_UNPARSEABLE_MARKERS = (
+    "LLM judge returned unparseable output",
+    "LLM judge call failed",
+)
 
 JUDGE_SYSTEM_PROMPT = """\
 You are an expert evaluator for a Retrieval-Augmented Generation (RAG) system.
@@ -37,15 +45,31 @@ def build_judge_llm() -> ChatOpenAI | None:
     )
 
 
+def _extract_first_json_object(text: str) -> str | None:
+    """Return the substring from the first '{' to its matching '}', or None."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
 def _parse_judge_response(raw_text: str) -> tuple[int, str]:
-    json_match = re.search(r"\{[^{}]*\"score\"\s*:\s*\d+[^{}]*\}", raw_text, re.DOTALL)
-    if json_match:
+    candidate = _extract_first_json_object(raw_text)
+    if candidate:
         try:
-            data = json.loads(json_match.group(0))
+            data = json.loads(candidate)
             score = int(data.get("score", 3))
             justification = str(data.get("justification", ""))
             return _clamp_score(score), justification
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
     score_match = re.search(r"\"score\"\s*:\s*(\d+)", raw_text)
@@ -63,7 +87,11 @@ def _clamp_score(score: int) -> int:
 
 def _judge(prompt: str, judge_llm: ChatOpenAI) -> tuple[int, str]:
     full_prompt = f"{JUDGE_SYSTEM_PROMPT}\n\n{prompt}"
-    response = judge_llm.invoke(full_prompt)
+    try:
+        response = judge_llm.invoke(full_prompt)
+    except Exception:
+        logger.exception("LLM judge call failed")
+        return 3, "LLM judge call failed (network/timeout/rate-limit)"
     raw = str(response.content) if hasattr(response, "content") else str(response)
     return _parse_judge_response(raw)
 
@@ -78,8 +106,15 @@ def _build_context_block(retrieved_docs: list[RetrievedDoc]) -> str:
             meta += f", file={doc.file_name}"
         if doc.page_number:
             meta += f", page={doc.page_number}"
-        lines.append(f"[{doc.rank}] ({meta}, score={doc.score:.4f})\n{doc.snippet}")
+        snippet = doc.snippet[:_MAX_SNIPPET_CHARS]
+        if len(doc.snippet) > _MAX_SNIPPET_CHARS:
+            snippet += "…(truncated)"
+        lines.append(f"[{doc.rank}] ({meta}, score={doc.score:.4f})\n{snippet}")
     return "\n\n".join(lines)
+
+
+def _is_unparseable(justification: str | None) -> bool:
+    return bool(justification) and any(justification.startswith(m) for m in _UNPARSEABLE_MARKERS)
 
 
 def _evaluate_metric(
@@ -227,7 +262,9 @@ def evaluate_noise_sensitivity(
     if not noise_contexts:
         return None
     noise_block = "\n\n".join(
-        f"[Noise {i}] {text}" for i, text in enumerate(noise_contexts, 1)
+        f"[Noise {i}] {text[:_MAX_SNIPPET_CHARS]}"
+        + ("…(truncated)" if len(text) > _MAX_SNIPPET_CHARS else "")
+        for i, text in enumerate(noise_contexts, 1)
     )
     prompt = NOISE_SENSITIVITY_PROMPT.format(
         question=question,
@@ -248,17 +285,16 @@ def evaluate_all_generation_metrics(
 ) -> GenerationEvalResult:
     context = _build_context_block(retrieved_docs)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
-        fut_faith = pool.submit(evaluate_faithfulness, question, answer, context, judge_llm)
-        fut_rel = pool.submit(evaluate_answer_relevance, question, answer, context, judge_llm)
-        fut_usage = pool.submit(evaluate_context_usage, question, answer, context, judge_llm)
-
-        faith_score, faith_just = fut_faith.result()
-        rel_score, rel_just = fut_rel.result()
-        usage_score, usage_just = fut_usage.result()
+    faith_score, faith_just = evaluate_faithfulness(question, answer, context, judge_llm)
+    rel_score, rel_just = evaluate_answer_relevance(question, answer, context, judge_llm)
+    usage_score, usage_just = evaluate_context_usage(question, answer, context, judge_llm)
 
     noise_result = evaluate_noise_sensitivity(question, answer, context, noise_contexts, judge_llm)
     noise_score, noise_just = noise_result if noise_result else (None, None)
+
+    unparseable_count = sum(
+        1 for j in (faith_just, rel_just, usage_just, noise_just) if _is_unparseable(j)
+    )
 
     return GenerationEvalResult(
         query_id=query_id,
@@ -270,18 +306,20 @@ def evaluate_all_generation_metrics(
         context_usage_justification=usage_just,
         noise_sensitivity_score=noise_score,
         noise_sensitivity_justification=noise_just,
+        unparseable_metric_count=unparseable_count,
     )
 
 
 def aggregate_generation(
     results: list[GenerationEvalResult],
-) -> dict[str, float | None]:
+) -> dict[str, float | int | None]:
     if not results:
         return {
             "avg_faithfulness": None,
             "avg_answer_relevance": None,
             "avg_context_usage": None,
             "avg_noise_sensitivity": None,
+            "unparseable_metric_count": 0,
         }
     n = len(results)
     noise_scores = [r.noise_sensitivity_score for r in results if r.noise_sensitivity_score is not None]
@@ -290,4 +328,5 @@ def aggregate_generation(
         "avg_answer_relevance": sum(r.answer_relevance_score for r in results) / n,
         "avg_context_usage": sum(r.context_usage_score for r in results) / n,
         "avg_noise_sensitivity": sum(noise_scores) / len(noise_scores) if noise_scores else None,
+        "unparseable_metric_count": sum(r.unparseable_metric_count for r in results),
     }

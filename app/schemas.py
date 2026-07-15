@@ -1,9 +1,26 @@
 from pydantic import BaseModel, Field
 
+from app.context_models import Context
+
 
 class ChatRequest(BaseModel):
     session_id: str = Field(..., description="Conversation session identifier.")
-    question: str = Field(..., min_length=1, description="User question.")
+    question: str = Field(
+        default="",
+        description=(
+            "User question. May be empty for context-driven turns (goods_card only, "
+            "image / video attachment, system messages) where the platform provides "
+            "the actual signal via `context`."
+        ),
+    )
+    context: Context | None = Field(
+        default=None,
+        description=(
+            "Optional platform context (shop_id, goods_id, media, context_type). "
+            "When the agent is embedded in a product page, the frontend fills this in. "
+            "If absent, the request is treated as a plain text turn."
+        ),
+    )
 
 
 class Citation(BaseModel):
@@ -19,6 +36,7 @@ class ChatResponse(BaseModel):
     answer: str
     trace_id: str | None = None
     intent: str = "general_qa"
+    context_type: str = "text"
     citations: list[Citation] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     need_handoff: bool = False

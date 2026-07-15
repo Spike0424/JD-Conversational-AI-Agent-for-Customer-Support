@@ -64,6 +64,7 @@ class GenerationEvalResult(BaseModel):
     context_usage_justification: str
     noise_sensitivity_score: int | None = None
     noise_sensitivity_justification: str | None = None
+    unparseable_metric_count: int = 0
 
 
 class EvalReport(BaseModel):
@@ -82,6 +83,8 @@ class EvalReport(BaseModel):
     avg_answer_relevance: float | None = None
     avg_context_usage: float | None = None
     avg_noise_sensitivity: float | None = None
+
+    unparseable_metric_count: int = 0
 
     retrieval_details: list[RetrievalEvalResult] = Field(default_factory=list)
     generation_details: list[GenerationEvalResult] | None = None

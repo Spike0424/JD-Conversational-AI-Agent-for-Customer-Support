@@ -185,10 +185,68 @@ class ReActQAAgent:
             logger.warning("Scene prompt not found: %s, using default", prompt_path)
             return REACT_SYSTEM_PROMPT
 
+    @staticmethod
+    def _safe_value(value: object) -> str:
+        """Escape user-supplied values before they're pasted into the system prompt.
+
+        Wraps in <input> tags so the LLM treats it as data, not instructions,
+        and doubles braces so it can't break out of an outer f-string template.
+        """
+        if value is None:
+            return ""
+        text = str(value).replace("{", "{{").replace("}", "}}")
+        # Strip newlines to prevent injecting newlines into system prompt structure.
+        text = text.replace("\n", " ").replace("\r", " ")
+        return f"<input>{text}</input>"
+
+    @staticmethod
+    def _format_session_info(dependencies: dict | None) -> str:
+        """把 dependencies 拼成【当前会话信息】 block，附在 system prompt 末尾。
+
+        所有 platform-provided 值都包在 <input>...</input> 中，避免用户内容
+        把 system prompt 注入伪指令。
+        """
+        if not dependencies:
+            return ""
+
+        def _line(label: str, value: object) -> str | None:
+            if value in (None, ""):
+                return None
+            return f"- {label}: {ReActQAAgent._safe_value(value)}"
+
+        lines: list[str] = []
+        for key, label in (
+            ("shop_id", "shop_id"),
+            ("shop_name", "shop_name"),
+            ("user_id", "user_id"),
+            ("recipient_uid", "recipient_uid"),
+            ("customer_uid", "customer_uid"),
+            ("context_type", "context_type"),
+            ("channel_type", "channel_type"),
+        ):
+            line = _line(label, dependencies.get(key))
+            if line:
+                lines.append(line)
+
+        if dependencies.get("goods_id"):
+            lines.append(
+                f"- goods_id: {ReActQAAgent._safe_value(dependencies['goods_id'])}"
+                "（当前商品，商品知识优先）"
+            )
+        if dependencies.get("goods_name"):
+            lines.append(f"- goods_name: {ReActQAAgent._safe_value(dependencies['goods_name'])}")
+        if dependencies.get("order_sn"):
+            lines.append(f"- order_sn: {ReActQAAgent._safe_value(dependencies['order_sn'])}")
+
+        if not lines:
+            return ""
+        return "\n\n【当前会话信息】\n" + "\n".join(lines)
+
     def _build_input_messages(
         self, session_id: str, question: str, scene: str = "",
+        dependencies: dict | None = None,
     ) -> list[dict[str, str]]:
-        system_prompt = self._load_scene_prompt(scene)
+        system_prompt = self._load_scene_prompt(scene) + self._format_session_info(dependencies)
         history = self._session_store.load(session_id=session_id)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -260,7 +318,7 @@ class ReActQAAgent:
     def _persist_user(self, session_id: str, question: str) -> None:
         self._session_store.append(session_id=session_id, role="user", content=question)
 
-    def ask(self, session_id: str, question: str, scene: str = "") -> str:
+    def ask(self, session_id: str, question: str, scene: str = "", dependencies: dict | None = None) -> str:
         started = time.perf_counter()
         max_retries = self._settings.chat_retries
         last_err: Exception | None = None
@@ -273,7 +331,7 @@ class ReActQAAgent:
                     session_id, scene, attempt + 1, max_retries + 1, question,
                 )
                 result = self._get_graph().invoke(
-                    {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene)},
+                    {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)},
                     config={"recursion_limit": self._settings.agent_recursion_limit},
                 )
                 raw_answer = self._extract_answer(result)
@@ -360,7 +418,7 @@ class ReActQAAgent:
     def ingest_pdf_path(self, pdf_path: str, source: str | None = None) -> int:
         return self._get_rag_index().add_pdf_path(pdf_path=pdf_path, source=source)
 
-    def ask_stream(self, session_id: str, question: str, scene: str = "") -> Iterator[str]:
+    def ask_stream(self, session_id: str, question: str, scene: str = "", dependencies: dict | None = None) -> Iterator[str]:
         started = time.perf_counter()
         max_retries = self._settings.chat_retries
         last_err: Exception | None = None
@@ -375,7 +433,7 @@ class ReActQAAgent:
 
                 answer_parts: list[str] = []
                 graph = self._get_graph()
-                messages = self._build_input_messages(session_id=session_id, question=question, scene=scene)
+                messages = self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)
                 stream = graph.stream(
                     {"messages": messages},
                     stream_mode="messages",
@@ -398,7 +456,7 @@ class ReActQAAgent:
                 answer = "".join(answer_parts).strip()
                 if not answer:
                     result = graph.invoke(
-                        {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene)},
+                        {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)},
                     )
                     answer = self._extract_answer(result)
                     if answer:

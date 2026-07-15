@@ -90,23 +90,24 @@ async def _with_retry_async(coro_factory: Callable[[], Any], error_code: str) ->
 
 
 async def _chat_async(
-    session_id: str, question: str, orchestrator: ChatOrchestrator,
+    session_id: str, question: str, context, orchestrator: ChatOrchestrator,
 ) -> ChatResponse | JSONResponse:
     try:
         return await _with_retry_async(
-            lambda: orchestrator.chat(session_id=session_id, question=question), "CHAT"
+            lambda: orchestrator.chat(session_id=session_id, question=question, context=context),
+            "CHAT",
         )
     except ValueError as exc:
         return _error_response(400, "BAD_REQUEST", str(exc))
 
 
 async def _streaming_response_for_question(
-    session_id: str, question: str, orchestrator: ChatOrchestrator
+    session_id: str, question: str, context, orchestrator: ChatOrchestrator
 ) -> StreamingResponse:
     trace_id = uuid.uuid4().hex
     try:
         trace_id, intent, citations, actions, chunks, _layer = await orchestrator.stream_chat(
-            session_id=session_id, question=question
+            session_id=session_id, question=question, context=context
         )
     except ValueError as exc:
         return StreamingResponse(
@@ -169,7 +170,7 @@ def _parse_get_chat_params(
 @router.post("/chat", response_model=ChatResponse)
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)) -> ChatResponse | JSONResponse:
-    return await _chat_async(request.session_id, request.question, orchestrator)
+    return await _chat_async(request.session_id, request.question, request.context, orchestrator)
 
 
 @router.post("/rag/documents", response_model=DocumentIngestResponse)
@@ -232,13 +233,13 @@ async def chat_get(
     if isinstance(parsed, JSONResponse):
         return parsed
     sid, q = parsed
-    return await _chat_async(sid, q, orchestrator)
+    return await _chat_async(sid, q, None, orchestrator)
 
 
 @router.post("/chat/stream")
 @router.post("/v1/chat/stream")
 async def chat_stream(request: ChatRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)) -> StreamingResponse:
-    return await _streaming_response_for_question(request.session_id, request.question, orchestrator)
+    return await _streaming_response_for_question(request.session_id, request.question, request.context, orchestrator)
 
 
 @router.get("/chat/stream", response_model=None)
@@ -257,7 +258,7 @@ async def chat_stream_get(
     if isinstance(parsed, JSONResponse):
         return parsed
     sid, q = parsed
-    return await _streaming_response_for_question(sid, q, orchestrator)
+    return await _streaming_response_for_question(sid, q, None, orchestrator)
 
 
 @router.post("/v1/handoff", response_model=HandoffResponse)
