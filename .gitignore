@@ -36,7 +36,7 @@ Thumbs.db
 logs/
 
 # ZOL 浏览器爬虫 profile
-script/.zol_browser_profile/
+script/
 
 # 截图/调试图片
 png/
