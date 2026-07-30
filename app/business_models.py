@@ -21,6 +21,7 @@ def _now() -> datetime:
 # ── Channel (渠道) ──────────────────────────────────────────────────
 
 class Channel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "channels"
     id: int | None = Field(default=None, primary_key=True)
     channel_name: str = Field(max_length=50, unique=True, nullable=False)
@@ -32,9 +33,11 @@ class Channel(SQLModel, table=True):
 # ── Shop (店铺) ─────────────────────────────────────────────────────
 
 class Shop(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "shops"
     __table_args__ = (
         UniqueConstraint("channel_id", "shop_id", name="uix_shop_channel_shop_id"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -58,9 +61,11 @@ class Shop(SQLModel, table=True):
 # ── Account (账号) ──────────────────────────────────────────────────
 
 class Account(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "accounts"
     __table_args__ = (
         UniqueConstraint("shop_id", "user_id", name="uix_account_shop_user"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -77,6 +82,7 @@ class Account(SQLModel, table=True):
 # ── Keyword (关键词) ────────────────────────────────────────────────
 
 class Keyword(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "keywords"
     id: int | None = Field(default=None, primary_key=True)
     keyword: str = Field(max_length=100, nullable=False)
@@ -85,9 +91,11 @@ class Keyword(SQLModel, table=True):
 # ── ProductKnowledge (产品知识) ─────────────────────────────────────
 
 class ProductKnowledge(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "product_knowledge"
     __table_args__ = (
         UniqueConstraint("shop_id", "goods_id", name="uix_product_knowledge_shop_goods"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -111,6 +119,7 @@ class ProductKnowledge(SQLModel, table=True):
 # ── CustomerServiceKnowledge (客服知识) ─────────────────────────────
 
 class CustomerServiceKnowledge(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "customer_service_knowledge"
     id: int | None = Field(default=None, primary_key=True)
     shop_id: int = Field(foreign_key="shops.id", nullable=False)
@@ -127,12 +136,14 @@ class CustomerServiceKnowledge(SQLModel, table=True):
 # ── KnowledgeMetaEntry (知识元数据) ─────────────────────────────────
 
 class KnowledgeMetaEntry(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "knowledge_meta_entries"
     __table_args__ = (
         UniqueConstraint(
             "source_type", "source_id", "scenario", "sub_intent", "aliases",
             name="uix_meta_source_alias",
         ),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -181,6 +192,7 @@ class SceneKnowledgeMixin(SQLModel):
 # ── PresaleKnowledge (售前知识) ─────────────────────────────────────
 
 class PresaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "presale_knowledge"
     __table_args__ = (
         UniqueConstraint(
@@ -190,6 +202,7 @@ class PresaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
         Index("ix_presale_goods", "shop_id", "goods_id", "enabled", "priority"),
         Index("ix_presale_family", "shop_id", "product_family", "enabled"),
         Index("ix_presale_intent", "shop_id", "sub_intent", "enabled"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -199,6 +212,7 @@ class PresaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
 # ── InsaleKnowledge (售中知识) ──────────────────────────────────────
 
 class InsaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "insale_knowledge"
     __table_args__ = (
         UniqueConstraint(
@@ -208,6 +222,7 @@ class InsaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
         Index("ix_insale_goods", "shop_id", "goods_id", "enabled", "priority"),
         Index("ix_insale_family", "shop_id", "product_family", "enabled"),
         Index("ix_insale_intent", "shop_id", "sub_intent", "enabled"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -217,6 +232,7 @@ class InsaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
 # ── AftersaleKnowledge (售后知识) ──────────────────────────────────
 
 class AftersaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "aftersale_knowledge"
     __table_args__ = (
         UniqueConstraint(
@@ -226,6 +242,7 @@ class AftersaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
         Index("ix_aftersale_goods", "shop_id", "goods_id", "enabled", "priority"),
         Index("ix_aftersale_family", "shop_id", "product_family", "enabled"),
         Index("ix_aftersale_intent", "shop_id", "sub_intent", "enabled"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -235,6 +252,7 @@ class AftersaleKnowledge(SceneKnowledgeMixin, SQLModel, table=True):
 # ── SceneKnowledgeEmbedding (场景 embedding) ────────────────────────
 
 class SceneKnowledgeEmbedding(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "scene_knowledge_embeddings"
     __table_args__ = (
         UniqueConstraint(
@@ -243,6 +261,7 @@ class SceneKnowledgeEmbedding(SQLModel, table=True):
         ),
         Index("ix_ske_shop_goods_scene", "shop_id", "goods_id", "scene"),
         Index("ix_ske_table_id", "knowledge_table", "knowledge_id"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -263,9 +282,11 @@ class SceneKnowledgeEmbedding(SQLModel, table=True):
 # ── TransferTargetConfig (转人工配置) ───────────────────────────────
 
 class TransferTargetConfig(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "transfer_target_configs"
     __table_args__ = (
         UniqueConstraint("shop_id", "source_user_id", name="uix_transfer_target_shop_source"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -282,9 +303,11 @@ class TransferTargetConfig(SQLModel, table=True):
 # ── AftersaleChunk (售后知识切片 + 向量) ──────────────────────────
 
 class AftersaleChunk(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "aftersale_chunks"
     __table_args__ = (
         Index("ix_aftersale_chunk_knowledge", "knowledge_id"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -298,9 +321,11 @@ class AftersaleChunk(SQLModel, table=True):
 
 
 class AgentMessage(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "agent_messages"
     __table_args__ = (
         Index("ix_agent_messages_session_timestamp", "session_id", "timestamp"),
+        {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
@@ -315,6 +340,7 @@ class AgentMessage(SQLModel, table=True):
 
 
 class OrderModel(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
     __tablename__ = "orders"
     __table_args__ = {"extend_existing": True}
 

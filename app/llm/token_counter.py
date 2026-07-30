@@ -1,4 +1,16 @@
-"""Token counting utility using tiktoken."""
+"""Token counting utility using tiktoken with DeepSeek-compatible fallback.
+
+DeepSeek models (deepseek-v4-flash etc.) are not in tiktoken's model registry.
+We fall back to `o200k_base` encoding (GPT-4o tokenizer), which is based on the
+same BPE algorithm and gives a close approximation (±5-10%) for DeepSeek's
+tokenizer. Writing a fully accurate token counter would require either:
+
+1. Downloading DeepSeek's specific tokenizer model (heavy dependency)
+2. Reimplementing BPE from scratch (thousands of lines)
+
+Neither is worthwhile since the count is only used for a compression-threshold
+heuristic — an approximation is sufficient."""
+
 
 import logging
 

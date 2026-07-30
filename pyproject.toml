@@ -27,6 +27,7 @@ dependencies = [
     "psycopg2-binary>=2.9.12",
     "sqlmodel>=0.0.38",
     "pgvector>=0.4.2",
+    "jieba>=0.42.1",
 ]
 
 [dependency-groups]

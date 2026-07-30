@@ -1,10 +1,10 @@
 """Tests for prompt-injection protection in _format_session_info."""
 
-from app.llm.agent_runtime import ReActQAAgent
+from app.llm.input_builder import InputBuilder
 
 
 def _format(deps: dict | None) -> str:
-    return ReActQAAgent._format_session_info(deps)
+    return InputBuilder.format_session_info(deps)
 
 
 def test_empty_dependencies_returns_empty() -> None:

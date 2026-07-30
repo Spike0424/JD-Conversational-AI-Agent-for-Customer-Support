@@ -13,23 +13,23 @@ os.environ.pop("DATABASE_URL", None)
 
 import chainlit as cl
 
+from app.context_models import ChannelKwargs, Context, ContextType
 from app.orchestrator.intent_router import CUSTOMER_SCENE_LABELS
 from app.orchestrator.service import ChatOrchestrator
 from app.schemas import Citation
+
+
+# Chainlit 调试默认 shop_id：与生产环境真实店铺 ID 保持一致（shops.id=7）。
+# 生产环境前端会从商品页上下文拿真实 shop_id 传过来。
+_DEFAULT_SHOP_ID = 7
+_DEFAULT_GOODS_ID = 57430876  # iPhone 17 Pro Max（调试用，生产前端从页面 URL 拿）
+_DEFAULT_USER_ID = "chainlit_tester"
 
 
 INGEST_HELP = """用法：
 
 普通聊天：直接输入问题。
 
-文档入库：使用 `/ingest 来源名`，下一行开始粘贴文档内容，例如：
-
-```text
-/ingest faq.md
-这里是需要进入向量库的文档内容
-```
-
-只有 `/ingest` 会对文档内容做 embedding 并写入向量库；普通聊天不会触发 embedding。
 """
 
 
@@ -81,7 +81,7 @@ def _format_citations(citations: list[Citation]) -> str:
 async def on_chat_start() -> None:
     _get_orchestrator()
     _get_session_id()
-    await cl.Message(content=f"你好，我是你的 LangChain QA Agent。\n\n{INGEST_HELP}").send()
+    await cl.Message(content=f"你好，我是你的 京东客服 小蜜。\n\n{INGEST_HELP}").send()
 
 
 @cl.on_message
@@ -111,18 +111,39 @@ async def on_message(message: cl.Message) -> None:
         return
 
     session_id = _get_session_id()
-    response = cl.Message(content="")
+
+    # Send immediate thinking indicator to keep websocket alive during LLM first-token wait
+    thinking = cl.Message(content="")
+    await thinking.send()
+    await thinking.stream_token("正在思考...")
 
     try:
+        ctx = Context(
+            type=ContextType.TEXT,
+            content=content,
+            kwargs=ChannelKwargs(
+                shop_id=str(_DEFAULT_SHOP_ID),
+                goods_id=_DEFAULT_GOODS_ID,
+                goods_name="iPhone 17 Pro Max",
+                user_id=_DEFAULT_USER_ID,
+                from_uid=_DEFAULT_USER_ID,
+            ),
+        )
         trace_id, scene, citations, actions, chunks, layer = await orchestrator.stream_chat(
             session_id=session_id,
             question=content,
+            context=ctx,
         )
+
+        # Remove thinking indicator, stream actual response
+        await thinking.remove()
+        response = cl.Message(content="")
         await response.stream_token(_format_meta(scene, actions, layer))
-        for chunk in chunks:
+        async for chunk in chunks:
             await response.stream_token(chunk)
         await response.stream_token(_format_citations(citations))
         await response.stream_token(f"\n\ntrace_id: `{trace_id}`")
         await response.send()
     except Exception as exc:  # noqa: BLE001
+        await thinking.remove()
         await cl.Message(content=f"请求失败：{exc}").send()

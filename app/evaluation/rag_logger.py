@@ -43,7 +43,7 @@ class RAGLogger:
                 {
                     "source": c.get("source", ""),
                     "score": round(c.get("score", 0), 4),
-                    "snippet": _safe_preview(c.get("snippet", ""), 120),
+                    "snippet": c.get("snippet", ""),
                 }
                 for c in fields["retrieved_chunks"][:10]
             ]
@@ -63,11 +63,13 @@ class RAGLogger:
             ]
 
         if "llm_answer" in fields:
-            record["llm_answer"] = _safe_preview(fields["llm_answer"], 500)
+            record["llm_answer"] = fields["llm_answer"]
         if "gold_answer" in fields:
-            record["gold_answer"] = _safe_preview(fields["gold_answer"], 500)
+            record["gold_answer"] = fields["gold_answer"]
 
-        logger.info("%s %s", _RAG_PREFIX, json.dumps(record, ensure_ascii=False))
+        phase = record.get("phase", "")
+        body = json.dumps({k: v for k, v in record.items() if k != "phase"}, ensure_ascii=False, indent=2)
+        logger.info(f"{_RAG_PREFIX} trace={request_id[:8]} phase={phase} {body}")
 
     # ── legacy phase methods (kept for backward compatibility) ──────
 

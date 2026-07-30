@@ -83,7 +83,7 @@ class EvalRunner:
                 else {}
             )
             session_id = f"eval-{dataset_name}-{query.query_id}"
-            classified_scene = await self._scene_classifier.classify(
+            classified_scene = self._scene_classifier.classify(
                 dependencies=dependencies,
                 question=query.question,
                 session_id=session_id,

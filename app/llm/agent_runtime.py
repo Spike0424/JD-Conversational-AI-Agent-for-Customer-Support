@@ -1,26 +1,55 @@
-import logging
-import re
-import time
-from collections.abc import Iterator
-from pathlib import Path
-from typing import Any
+"""Direct LLM agent with single-round tool calling (no ReAct loop).
 
-from langchain.agents import create_agent
+Fully async: uses ainvoke / astream and asyncio.sleep so the event loop
+isn't blocked during retries or LLM calls.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.orchestrator.request_state import RequestState, RequestTracker
+
+from langchain_core.messages import ToolMessage, convert_to_messages
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from app.config import Settings, get_settings
+from app.config import get_settings
 from app.evaluation.rag_logger import RAGLogger
-from app.llm.token_counter import count_tokens
-from app.rag import RAGIndex
+from app.llm.input_builder import InputBuilder
 from app.session_store import SessionStore
-from app.tools.search_knowledge import SearchKnowledge, set_search_knowledge
+from app.tools.search_knowledge import SearchKnowledge, get_search_knowledge, set_search_knowledge
+from app.tools.send_product_card import pop_cards_for_session
 from util.agent_tool import get_registered_tools
 
 logger = logging.getLogger(__name__)
 
+_L1_RETRY_NUDGE = "上一次回答为空。请直接给出简明中文回答，不要只思考。"
 
-def _thinking_extra_body(settings: Settings) -> dict[str, Any] | None:
+# Lazy-loaded to avoid circular import (app.orchestrator.__init__ -> service -> agent_runtime)
+_RequestState = None
+
+
+def _RS():
+    """Cached RequestState enum import."""
+    global _RequestState
+    if _RequestState is None:
+        from app.orchestrator.request_state import RequestState
+        _RequestState = RequestState
+    return _RequestState
+
+
+def _append_retry_nudge(messages: list[dict]) -> list[dict]:
+    messages.append({"role": "system", "content": _L1_RETRY_NUDGE})
+    return messages
+
+
+def _thinking_extra_body(settings) -> dict[str, Any] | None:
     mode = (settings.chat_thinking_mode or "auto").strip().lower()
     base = (settings.openai_base_url or "").lower()
     if mode == "auto" and "deepseek.com" in base:
@@ -32,23 +61,14 @@ def _thinking_extra_body(settings: Settings) -> dict[str, Any] | None:
     return None
 
 
-E_COMMERCE_PLATFORMS = "京东"
-
-REACT_SYSTEM_PROMPT = f"""You are an intelligent question-answering assistant for a Chinese e-commerce customer service scenario.
-Use a ReAct style workflow internally:
-1) Reason about the question.
-2) Call search_knowledge to retrieve relevant information from the knowledge base about {E_COMMERCE_PLATFORMS} products, policies, shipping, and after-sales procedures.
-3) Observe tool outputs.
-4) Answer the question based on the retrieved information.
-
-Never expose chain-of-thought in your final response.
-Return only a concise and helpful final answer in Chinese unless user asks otherwise."""
-
-
-AGENS_SYSTEM_PROMPT = "你是一个对话摘要助手，简明总结对话要点。"
+def _backoff_delay(attempt: int) -> float:
+    """Exponential backoff: 0.5s, 1s, 2s, 4s, 8s (capped)."""
+    return min(0.5 * (2 ** attempt), 8.0)
 
 
 class ReActQAAgent:
+    """Direct LLM agent with optional single-round tool calling."""
+
     def __init__(self) -> None:
         self._settings = get_settings()
         self._session_store = SessionStore(max_history_turns=self._settings.max_history_turns)
@@ -61,11 +81,9 @@ class ReActQAAgent:
             request_timeout=self._settings.chat_timeout_seconds,
             extra_body=_thinking_extra_body(self._settings),
         )
-        self._graph: Any = None
 
         set_search_knowledge(SearchKnowledge())
 
-        # Agens LLM for history compression (independent config)
         self._agens_llm: ChatOpenAI | None = None
         if self._settings.agens_api_key and self._settings.agens_base_url:
             self._agens_llm = ChatOpenAI(
@@ -76,8 +94,23 @@ class ReActQAAgent:
                 request_timeout=self._settings.chat_timeout_seconds,
             )
 
-    def _create_graph(self):
-        langchain_tools: list = []
+        self._input_builder = InputBuilder(
+            session_store=self._session_store,
+            settings=self._settings,
+            agens_llm=self._agens_llm,
+        )
+
+        self._langchain_tools = self._build_langchain_tools()
+        self._llm_with_tools = (
+            self._llm.bind_tools(self._langchain_tools, parallel_tool_calls=False)
+            if self._langchain_tools else self._llm
+        )
+        self._tools_by_name = {e.name: e for e in get_registered_tools()}
+
+    # ── Tool wiring ───────────────────────────────────────────────────
+
+    def _build_langchain_tools(self) -> list:
+        result: list = []
         for entry in get_registered_tools():
             if entry.param_model is not None:
                 wrapped = tool(
@@ -87,68 +120,56 @@ class ReActQAAgent:
                 )(entry.func)
             else:
                 wrapped = tool(entry.name, description=entry.description)(entry.func)
-            langchain_tools.append(wrapped)
-        if not langchain_tools:
-            raise ValueError("No tools registered.  Ensure search_knowledge is imported and decorated.")
+            result.append(wrapped)
+        return result
 
-        return create_agent(
-            model=self._llm,
-            tools=langchain_tools,
-            debug=False,
-        )
+    def _execute_tool_call(self, tool_call: Any, tracker: RequestTracker | None) -> str:
+        name = getattr(tool_call, "name", "") or (tool_call.get("name", "") if isinstance(tool_call, dict) else "")
+        args = getattr(tool_call, "args", {}) or (tool_call.get("args", {}) if isinstance(tool_call, dict) else {})
+        RS = _RS()
+        if tracker:
+            state = RS.TOOL_SEARCH if name == "search_knowledge" else RS.TOOL_PRODUCT_CARD if name == "send_product_card" else RS.TOOL_DONE
+            tracker.transition(state, tool=name)
+        entry = self._tools_by_name.get(name)
+        if entry is None:
+            return f"工具 {name} 不存在"
+        try:
+            if tracker and name == "search_knowledge":
+                _sk = get_search_knowledge()
+                if _sk:
+                    _sk.set_tracker(tracker)
+            result = str(entry.func(**args))
+            logger.info("【Tool 结果】tool=%s result_len=%d result=%.500s", name, len(result), result)
+            if tracker:
+                tracker.transition(RS.TOOL_DONE, tool=name)
+            return result
+        except Exception as exc:
+            logger.exception("Tool %s failed", name)
+            return f"工具 {name} 执行失败：{exc}"
 
-    def _get_graph(self):
-        if self._graph is None:
-            self._graph = self._create_graph()
-        return self._graph
+    # ── Response parsing ──────────────────────────────────────────────
 
     @staticmethod
     def _extract_text(content: Any) -> str:
         if isinstance(content, list):
-            return " ".join(str(item.get("text", "") if isinstance(item, dict) else item) for item in content).strip()
+            return " ".join(
+                str(item.get("text", "") if isinstance(item, dict) else item)
+                for item in content
+            ).strip()
         return str(content).strip()
 
-    @staticmethod
-    def _extract_answer(result: dict[str, Any]) -> str:
-        messages = result.get("messages", [])
-        if not messages:
-            return ""
-        content = getattr(messages[-1], "content", "")
-        return ReActQAAgent._extract_text(content)
+    # ── Product card buffer ───────────────────────────────────────────
 
-    @staticmethod
-    def _normalize_text(text: str) -> str:
-        return re.sub(r"\s+", " ", text.strip())
+    def pop_product_cards(self, session_id: str) -> list[dict]:
+        return pop_cards_for_session(session_id)
 
-    def _normalize_answer(self, raw: str, session_id: str) -> str:
-        """Filter internal terms, dedup against last assistant message, persist to history.
+    def recent_user_messages(self, session_id: str, n: int = 3) -> list[str]:
+        return self._session_store.recent_user_messages(session_id, n=n)
 
-        L4: empty answer is NOT persisted to history (avoids polluting future context).
-        """
-        filtered = raw
-        for word in self._settings.output_filter_words:
-            filtered = filtered.replace(word, "")
-
-        # L4: empty after filtering → return empty, do not persist
-        if not filtered.strip():
-            return ""
-
-        normalized = self._normalize_text(filtered)
-        last = self._session_store.load_last_assistant(session_id)
-        if last is not None and self._normalize_text(last) == normalized:
-            logger.info("Dedup hit session_id=%s — skipping history write", session_id)
-            return filtered
-
-        self._session_store.append(
-            session_id=session_id, role="assistant", content=filtered,
-        )
-        return filtered
+    # ── L2 fallback ───────────────────────────────────────────────────
 
     def _fallback_to_knowledge_base(self, question: str, scene: str) -> str:
-        """L2: Try to answer directly from SearchKnowledge when LLM produces empty."""
         try:
-            from app.tools.search_knowledge import get_search_knowledge
-
             sk = get_search_knowledge()
             if sk is None:
                 return ""
@@ -162,167 +183,176 @@ class ReActQAAgent:
             logger.exception("L2 knowledge base fallback failed")
             return ""
 
-    _SCENE_PROMPT_FILE: dict[str, str] = {
-        "presale": "presales.md",
-        "insale": "sales.md",
-        "aftersale": "aftersales.md",
-        "mixed": "mixed.md",
-    }
+    # ── Pre-warm ───────────────────────────────────────────────────────
 
-    def _load_scene_prompt(self, scene: str) -> str:
-        """Load scene-specific system prompt from prompt/{file}, fallback to default."""
-        if not scene or not scene.strip():
-            return REACT_SYSTEM_PROMPT
-
-        filename = self._SCENE_PROMPT_FILE.get(scene.strip())
-        if not filename:
-            return REACT_SYSTEM_PROMPT
-
-        prompt_path = Path(self._settings.prompt_dir) / filename
+    def prewarm(self) -> None:
+        logger.info("Pre-warming agent …")
+        from app.retrieval.embedding import get_embeddings
+        get_embeddings()
         try:
-            return prompt_path.read_text(encoding="utf-8").strip()
-        except (FileNotFoundError, OSError):
-            logger.warning("Scene prompt not found: %s, using default", prompt_path)
-            return REACT_SYSTEM_PROMPT
+            from app.orchestrator.scene_classifier import _jd_pool_getconn, _jd_pool_putconn
+            conn = _jd_pool_getconn()
+            _jd_pool_putconn(conn)
+        except Exception as exc:
+            logger.warning("DB pool pre-warm failed: %s", exc)
+        logger.info("Agent pre-warm complete")
+
+    # ── Core LLM call with single-round tool ──────────────────────────
 
     @staticmethod
-    def _safe_value(value: object) -> str:
-        """Escape user-supplied values before they're pasted into the system prompt.
+    def _log_llm_messages(lc_messages: list, label: str) -> None:
+        parts = []
+        for i, msg in enumerate(lc_messages):
+            role = msg.__class__.__name__.replace("Message", "")
+            content = getattr(msg, "content", "")
+            tool_calls = getattr(msg, "tool_calls", None)
+            text = str(content)[:300] if content else ""
+            line = f"  [{i}] {role}: {text}"
+            if tool_calls:
+                line += f" tool_calls={len(tool_calls)}"
+            parts.append(line)
+        logger.info("【LLM Messages】%s (%d msgs)\n%s", label, len(lc_messages), "\n".join(parts))
 
-        Wraps in <input> tags so the LLM treats it as data, not instructions,
-        and doubles braces so it can't break out of an outer f-string template.
+    async def _ainvoke_with_tools(
+        self,
+        messages: list[dict],
+        allow_tools: bool,
+        tracker: RequestTracker | None,
+    ) -> str:
+        """Call LLM. If allow_tools and LLM requests tools, execute them once
+        and call LLM again (no tools) to produce final answer.
+
+        On L1 retry, allow_tools=False to prevent re-executing tools.
         """
-        if value is None:
-            return ""
-        text = str(value).replace("{", "{{").replace("}", "}}")
-        # Strip newlines to prevent injecting newlines into system prompt structure.
-        text = text.replace("\n", " ").replace("\r", " ")
-        return f"<input>{text}</input>"
+        lc_messages = convert_to_messages(messages)
+        llm = self._llm_with_tools if allow_tools else self._llm
+        response = await llm.ainvoke(lc_messages)
 
-    @staticmethod
-    def _format_session_info(dependencies: dict | None) -> str:
-        """把 dependencies 拼成【当前会话信息】 block，附在 system prompt 末尾。
+        if not allow_tools:
+            self._log_llm_messages(lc_messages, "ainvoke_no_tools")
+            return self._extract_text(getattr(response, "content", ""))
 
-        所有 platform-provided 值都包在 <input>...</input> 中，避免用户内容
-        把 system prompt 注入伪指令。
+        tool_calls = getattr(response, "tool_calls", None)
+        if not tool_calls:
+            return self._extract_text(getattr(response, "content", ""))
+
+        lc_messages.append(response)
+        for tc in tool_calls:
+            output = self._execute_tool_call(tc, tracker)
+            tc_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
+            lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
+
+        self._log_llm_messages(lc_messages, "ainvoke_final")
+        final = await self._llm.ainvoke(lc_messages)
+        return self._extract_text(getattr(final, "content", ""))
+
+    async def _stream_with_tools(
+        self,
+        messages: list[dict],
+        tracker: RequestTracker | None,
+    ) -> AsyncIterator[str]:
+        """真流式输出：astream_events 逐 token yield。
+
+        策略：
+        1. 先用 astream_events 流式调 llm_with_tools
+           - 如果 LLM 直接输出文本 -> 逐 token yield（最常见场景，真流式）
+           - 如果 LLM 要调 tool -> 不会有文本 token，只有 tool_calls
+        2. 检查 astream_events 结束后是否有 tool_calls
+           - 有 -> 执行 tool，追加 ToolMessage，再 astream_events 流式输出最终回答
+           - 无 -> 已经 yield 完了，直接返回
+
+        用 astream_events 而不是 ainvoke，确保无 tool 时也能逐字输出。
         """
-        if not dependencies:
-            return ""
+        lc_messages = convert_to_messages(messages)
 
-        def _line(label: str, value: object) -> str | None:
-            if value in (None, ""):
-                return None
-            return f"- {label}: {ReActQAAgent._safe_value(value)}"
+        # Phase 1: 流式调用 llm_with_tools，逐 token yield
+        collected_tool_calls: list = []
+        final_response: Any = None
 
-        lines: list[str] = []
-        for key, label in (
-            ("shop_id", "shop_id"),
-            ("shop_name", "shop_name"),
-            ("user_id", "user_id"),
-            ("recipient_uid", "recipient_uid"),
-            ("customer_uid", "customer_uid"),
-            ("context_type", "context_type"),
-            ("channel_type", "channel_type"),
-        ):
-            line = _line(label, dependencies.get(key))
-            if line:
-                lines.append(line)
+        async for event in self._llm_with_tools.astream_events(lc_messages, version="v2"):
+            kind = event.get("event", "")
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk is None:
+                    continue
+                text = self._extract_text(getattr(chunk, "content", ""))
+                if text:
+                    yield text
+            elif kind == "on_chat_model_end":
+                final_response = event.get("data", {}).get("output")
+                if final_response:
+                    collected_tool_calls = getattr(final_response, "tool_calls", None) or []
 
-        if dependencies.get("goods_id"):
-            lines.append(
-                f"- goods_id: {ReActQAAgent._safe_value(dependencies['goods_id'])}"
-                "（当前商品，商品知识优先）"
-            )
-        if dependencies.get("goods_name"):
-            lines.append(f"- goods_name: {ReActQAAgent._safe_value(dependencies['goods_name'])}")
-        if dependencies.get("order_sn"):
-            lines.append(f"- order_sn: {ReActQAAgent._safe_value(dependencies['order_sn'])}")
+        if not collected_tool_calls:
+            return
 
-        if not lines:
-            return ""
-        return "\n\n【当前会话信息】\n" + "\n".join(lines)
+        # Phase 2: 有 tool 调用 -> 执行 tool，再流式输出最终回答
+        lc_messages.append(final_response)
+        for tc in collected_tool_calls:
+            output = self._execute_tool_call(tc, tracker)
+            tc_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
+            lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
 
-    def _build_input_messages(
-        self, session_id: str, question: str, scene: str = "",
+        self._log_llm_messages(lc_messages, "astream_final")
+        async for event in self._llm.astream_events(lc_messages, version="v2"):
+            kind = event.get("event", "")
+            if kind == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk is None:
+                    continue
+                text = self._extract_text(getattr(chunk, "content", ""))
+                if text:
+                    yield text
+
+    def _resolve_fallback_answer(
+        self,
+        question: str,
+        scene: str,
+        last_err: Exception | None,
+        tracker: RequestTracker | None,
+        is_stream: bool,
+    ) -> str:
+        """L2 (knowledge base) -> L3 (default reply) fallback. Used by both ask() and ask_stream()."""
+        RS = _RS()
+        answer = self._fallback_to_knowledge_base(question, scene)
+        if tracker and answer:
+            tracker.transition(RS.L2_FALLBACK)
+
+        if answer:
+            logger.warning("L2 %sknowledge-base fallback used", "streaming " if is_stream else "")
+            return answer
+
+        if tracker:
+            tracker.transition(RS.L3_DEFAULT)
+        logger.error(
+            "All %sfallbacks exhausted last_err=%s",
+            "streaming " if is_stream else "", last_err,
+        )
+        return "抱歉，我暂时无法回答，请换个问题或稍后再试。"
+
+    # ── ask ───────────────────────────────────────────────────────────
+
+    async def ask(
+        self,
+        session_id: str,
+        question: str,
+        scene: str = "",
         dependencies: dict | None = None,
-    ) -> list[dict[str, str]]:
-        system_prompt = self._load_scene_prompt(scene) + self._format_session_info(dependencies)
-        history = self._session_store.load(session_id=session_id)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            *history,
-            {"role": "user", "content": question},
-        ]
-        return self._compress_history(messages, session_id)
-
-    def _compress_history(
-        self, messages: list[dict[str, str]], session_id: str
-    ) -> list[dict[str, str]]:
-        """Compress old messages into a summary when token count exceeds threshold."""
-        if not self._agens_llm:
-            return messages
-
-        token_count = count_tokens(messages, self._settings.model_name)
-        threshold = int(self._settings.history_window_tokens * self._settings.history_compress_threshold)
-
-        if token_count <= threshold:
-            return messages
-
+        tracker: RequestTracker | None = None,
+    ) -> str:
         logger.info(
-            "Compressing history session_id=%s tokens=%s threshold=%s",
-            session_id, token_count, threshold,
+            "══════════════════ Q&A ── session=%s scene=%s ── question=%s ══════════════════",
+            session_id, scene, question,
         )
-
-        keep_count = self._settings.history_keep_recent_turns * 2
-        if keep_count >= len(messages):
-            return messages
-
-        old_messages = messages[:-keep_count]
-        keep_messages = messages[-keep_count:]
-
-        # Build compression prompt
-        old_text = "\n".join(
-            f"{m['role']}: {m['content']}" for m in old_messages
-        )
-        compress_prompt = f"请总结以下对话历史，保留关键信息：\n\n{old_text}"
-
-        try:
-            summary_msg = self._agens_llm.invoke([
-                {"role": "system", "content": AGENS_SYSTEM_PROMPT},
-                {"role": "user", "content": compress_prompt},
-            ])
-            summary = (
-                getattr(summary_msg, "content", "") if hasattr(summary_msg, "content") else str(summary_msg)
-            )
-        except Exception:
-            logger.exception("History compression failed session_id=%s", session_id)
-            return messages
-
-        if not summary.strip():
-            return messages
-
-        # Persist summary as system message
-        self._session_store.append(
-            session_id=session_id,
-            role="system",
-            content=f"[历史摘要] {summary.strip()}",
-        )
-
-        logger.info(
-            "History compressed session_id=%s old_messages=%s summary_len=%s",
-            session_id, len(old_messages), len(summary),
-        )
-
-        return [{"role": "system", "content": summary.strip()}, *keep_messages]
-
-    def _persist_user(self, session_id: str, question: str) -> None:
-        self._session_store.append(session_id=session_id, role="user", content=question)
-
-    def ask(self, session_id: str, question: str, scene: str = "", dependencies: dict | None = None) -> str:
         started = time.perf_counter()
         max_retries = self._settings.chat_retries
         last_err: Exception | None = None
         answer = ""
+
+        messages = await self._input_builder.build_input_messages(
+            session_id=session_id, question=question,
+            scene=scene, dependencies=dependencies,
+        )
 
         for attempt in range(max_retries + 1):
             try:
@@ -330,99 +360,77 @@ class ReActQAAgent:
                     "Agent request session_id=%s scene=%s attempt=%s/%s question=%s",
                     session_id, scene, attempt + 1, max_retries + 1, question,
                 )
-                result = self._get_graph().invoke(
-                    {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)},
-                    config={"recursion_limit": self._settings.agent_recursion_limit},
-                )
-                raw_answer = self._extract_answer(result)
-                answer = self._normalize_answer(raw_answer, session_id)
 
-                # L1: silent retry on empty answer
+                # L1 retry nudge: on retry, append a system message asking for
+                # direct answer. Helps when the first attempt returned empty
+                # due to over-cautious safety filter or thinking-only output.
+                if attempt > 0:
+                    _append_retry_nudge(messages)
+
+                if tracker:
+                    tracker.transition(_RS().LLM_GENERATING)
+                raw_answer = await self._ainvoke_with_tools(messages, allow_tools=(attempt == 0), tracker=tracker)
+                answer = self._input_builder.normalize_answer(raw_answer, session_id)
+
                 if not answer:
                     if attempt < max_retries:
-                        delay = 0.5 * (attempt + 1)
+                        if tracker:
+                            tracker.transition(_RS().L1_RETRY, attempt=attempt + 1)
+                        delay = _backoff_delay(attempt)
                         logger.warning(
-                            "Empty answer attempt=%s/%s delay=%.1fs session_id=%s — retrying",
+                            "Empty answer attempt=%s/%s delay=%.1fs session_id=%s - retrying",
                             attempt + 1, max_retries + 1, delay, session_id,
                         )
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                         continue
-                    # All retries exhausted → break out to fallback path
                     break
 
-                self._persist_user(session_id, question)
+                self._input_builder.persist_user(session_id, question)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                logger.info("Agent response session_id=%s elapsed_ms=%s", session_id, elapsed_ms)
-                RAGLogger.log_trace(
-                    session_id,
-                    phase="generation",
-                    user_query=question,
-                    scene=scene,
-                    llm_answer=answer,
-                    elapsed_ms=elapsed_ms,
+                logger.info(
+                    "【LLM 输出】session=%s elapsed=%dms answer=%s",
+                    session_id, elapsed_ms, answer,
                 )
                 return answer
             except Exception as exc:
                 last_err = exc
                 if attempt < max_retries:
-                    delay = 0.5 * (attempt + 1)
+                    delay = _backoff_delay(attempt)
                     logger.warning(
                         "Agent retry %s/%s delay=%.1fs session_id=%s error=%s",
                         attempt + 1, max_retries, delay, session_id, exc,
                     )
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
 
-        # ── Fallback path: L1 retries exhausted OR last_err ──
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        self._persist_user(session_id, question)
-
-        # L2: knowledge base direct fallback
-        answer = self._fallback_to_knowledge_base(question, scene)
-
-        # L3: default reply if L2 also fails
-        if not answer:
-            answer = "抱歉，我暂时无法回答，请换个问题或稍后再试。"
-            logger.error(
-                "All fallbacks exhausted session_id=%s last_err=%s",
-                session_id, last_err,
-            )
-        else:
-            logger.warning(
-                "L2 knowledge-base fallback used session_id=%s",
-                session_id,
-            )
-
-        RAGLogger.log_trace(
-            session_id,
-            phase="generation",
-            user_query=question,
-            scene=scene,
-            llm_answer=answer,
-            elapsed_ms=elapsed_ms,
-            error=str(last_err) if last_err else "empty_answer",
+        # ── Fallback path ──
+        self._input_builder.persist_user(session_id, question)
+        return self._resolve_fallback_answer(
+            question=question, scene=scene, last_err=last_err, tracker=tracker, is_stream=False,
         )
-        return answer
 
-    def _get_rag_index(self) -> RAGIndex:
-        # Lazy-init only for admin ingest, not used in chat path
-        if not hasattr(self, "_rag_idx"):
-            self._rag_idx = RAGIndex(self._settings)
-        return self._rag_idx
+    # ── ask_stream ────────────────────────────────────────────────────
 
-    def ingest_document(self, source: str, content: str) -> int:
-        return self._get_rag_index().add_document(source=source, content=content)
-
-    def ingest_pdf_bytes(self, source: str, filename: str, pdf_bytes: bytes) -> int:
-        return self._get_rag_index().add_pdf_bytes(source=source, filename=filename, pdf_bytes=pdf_bytes)
-
-    def ingest_pdf_path(self, pdf_path: str, source: str | None = None) -> int:
-        return self._get_rag_index().add_pdf_path(pdf_path=pdf_path, source=source)
-
-    def ask_stream(self, session_id: str, question: str, scene: str = "", dependencies: dict | None = None) -> Iterator[str]:
+    async def ask_stream(
+        self,
+        session_id: str,
+        question: str,
+        scene: str = "",
+        dependencies: dict | None = None,
+        tracker: RequestTracker | None = None,
+    ) -> AsyncIterator[str]:
+        logger.info(
+            "══════════════════ Q&A (stream) ── session=%s scene=%s ── question=%s ══════════════════",
+            session_id, scene, question,
+        )
         started = time.perf_counter()
         max_retries = self._settings.chat_retries
         last_err: Exception | None = None
         answer = ""
+
+        messages = await self._input_builder.build_input_messages(
+            session_id=session_id, question=question,
+            scene=scene, dependencies=dependencies,
+        )
 
         for attempt in range(max_retries + 1):
             try:
@@ -431,102 +439,51 @@ class ReActQAAgent:
                     session_id, scene, attempt + 1, max_retries + 1, question,
                 )
 
+                if attempt > 0:
+                    _append_retry_nudge(messages)
+
                 answer_parts: list[str] = []
-                graph = self._get_graph()
-                messages = self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)
-                stream = graph.stream(
-                    {"messages": messages},
-                    stream_mode="messages",
-                    config={"recursion_limit": self._settings.agent_recursion_limit},
-                )
-
-                for event in stream:
-                    chunk = event[0] if isinstance(event, tuple) else event
-                    chunk_type = chunk.__class__.__name__
-                    if "AIMessageChunk" not in chunk_type:
-                        continue
-
-                    text = self._extract_text(getattr(chunk, "content", ""))
-                    if not text:
-                        continue
-
-                    answer_parts.append(text)
-                    yield text
+                if tracker:
+                    tracker.transition(_RS().LLM_GENERATING)
+                async for chunk in self._stream_with_tools(messages, tracker):
+                    answer_parts.append(chunk)
+                    yield chunk
 
                 answer = "".join(answer_parts).strip()
-                if not answer:
-                    result = graph.invoke(
-                        {"messages": self._build_input_messages(session_id=session_id, question=question, scene=scene, dependencies=dependencies)},
-                    )
-                    answer = self._extract_answer(result)
-                    if answer:
-                        yield answer
+                answer = self._input_builder.normalize_answer(answer, session_id)
 
-                answer = self._normalize_answer(answer, session_id)
-
-                # L1: silent retry on empty answer
                 if not answer:
                     if attempt < max_retries:
-                        delay = 0.5 * (attempt + 1)
+                        if tracker:
+                            tracker.transition(_RS().L1_RETRY, attempt=attempt + 1)
+                        delay = _backoff_delay(attempt)
                         logger.warning(
-                            "Empty streaming answer attempt=%s/%s delay=%.1fs session_id=%s — retrying",
+                            "Empty streaming answer attempt=%s/%s delay=%.1fs session_id=%s - retrying",
                             attempt + 1, max_retries + 1, delay, session_id,
                         )
-                        time.sleep(delay)
+                        await asyncio.sleep(delay)
                         continue
                     break
 
-                self._persist_user(session_id, question)
+                self._input_builder.persist_user(session_id, question)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                logger.info("Streaming response session_id=%s elapsed_ms=%s", session_id, elapsed_ms)
-                RAGLogger.log_trace(
-                    session_id,
-                    phase="generation",
-                    user_query=question,
-                    scene=scene,
-                    llm_answer=answer,
-                    elapsed_ms=elapsed_ms,
+                logger.info(
+                    "【LLM 输出】session=%s elapsed=%dms answer=%s",
+                    session_id, elapsed_ms, answer,
                 )
                 return
             except Exception as exc:
                 last_err = exc
                 if attempt < max_retries:
-                    delay = 0.5 * (attempt + 1)
+                    delay = _backoff_delay(attempt)
                     logger.warning(
                         "Streaming retry %s/%s delay=%.1fs session_id=%s error=%s",
                         attempt + 1, max_retries, delay, session_id, exc,
                     )
-                    time.sleep(delay)
+                    await asyncio.sleep(delay)
 
-        # ── Fallback path: L1 retries exhausted OR last_err ──
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        self._persist_user(session_id, question)
-
-        # L2: knowledge base direct fallback
-        answer = self._fallback_to_knowledge_base(question, scene)
-
-        # L3: default reply if L2 also fails
-        if not answer:
-            answer = "抱歉，我暂时无法回答，请换个问题或稍后再试。"
-            logger.error(
-                "All streaming fallbacks exhausted session_id=%s last_err=%s",
-                session_id, last_err,
-            )
-        else:
-            logger.warning(
-                "L2 streaming knowledge-base fallback used session_id=%s",
-                session_id,
-            )
-
-        yield answer
-
-        RAGLogger.log_trace(
-            session_id,
-            phase="generation",
-            user_query=question,
-            scene=scene,
-            llm_answer=answer,
-            elapsed_ms=elapsed_ms,
-            error=str(last_err) if last_err else "empty_answer",
+        # ── Fallback path ──
+        self._input_builder.persist_user(session_id, question)
+        yield self._resolve_fallback_answer(
+            question=question, scene=scene, last_err=last_err, tracker=tracker, is_stream=True,
         )
-        return

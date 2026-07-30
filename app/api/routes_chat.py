@@ -1,11 +1,10 @@
 import asyncio
 import json
-import time
 import uuid
-from collections.abc import Callable, Iterator
-from typing import Any, TypeVar
+from collections.abc import AsyncIterator, Callable
+from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import get_orchestrator
@@ -14,15 +13,10 @@ from app.orchestrator import ChatOrchestrator
 from app.schemas import (
     ChatRequest,
     ChatResponse,
-    DocumentIngestRequest,
-    DocumentIngestResponse,
     ErrorResponse,
     HandoffRequest,
     HandoffResponse,
-    PdfPathIngestRequest,
 )
-
-_T = TypeVar("_T")
 
 router = APIRouter(tags=["chat"])
 
@@ -43,28 +37,6 @@ def _error_response(status_code: int, error_code: str, message: str, trace_id: s
         trace_id=trace_id or uuid.uuid4().hex,
     ).model_dump()
     return JSONResponse(status_code=status_code, content=payload)
-
-
-def _with_retry(fn: Callable[[], _T], error_code: str) -> _T | JSONResponse:
-    """Execute *fn* with linear-backoff retry on transient upstream failures."""
-    settings = get_settings()
-    max_retries = max(0, settings.chat_retries)
-    last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            return fn()
-        except ValueError:
-            raise
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if attempt >= max_retries:
-                return _error_response(
-                    502,
-                    f"{error_code}_FAILED",
-                    f"Upstream request failed after {max_retries + 1} attempt(s): {exc}",
-                )
-            time.sleep(0.5 * (attempt + 1))
-    return _error_response(502, f"{error_code}_FAILED", str(last_error))
 
 
 async def _with_retry_async(coro_factory: Callable[[], Any], error_code: str) -> Any:
@@ -128,7 +100,7 @@ async def _streaming_response_for_question(
             media_type="text/event-stream",
         )
 
-    def event_stream() -> Iterator[str]:
+    async def event_stream() -> AsyncIterator[str]:
         try:
             meta = {
                 "trace_id": trace_id,
@@ -137,7 +109,7 @@ async def _streaming_response_for_question(
                 "actions": actions,
             }
             yield f"data: {json.dumps({'meta': meta}, ensure_ascii=False)}\n\n"
-            for chunk in chunks:
+            async for chunk in chunks:
                 yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:  # noqa: BLE001
@@ -171,53 +143,6 @@ def _parse_get_chat_params(
 @router.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)) -> ChatResponse | JSONResponse:
     return await _chat_async(request.session_id, request.question, request.context, orchestrator)
-
-
-@router.post("/rag/documents", response_model=DocumentIngestResponse)
-@router.post("/v1/rag/documents", response_model=DocumentIngestResponse)
-def ingest_document(
-    request: DocumentIngestRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)
-) -> DocumentIngestResponse | JSONResponse:
-    try:
-        return _with_retry(
-            lambda: orchestrator.ingest_document(source=request.source, content=request.content),
-            "INGEST",
-        )
-    except ValueError as exc:
-        return _error_response(400, "BAD_REQUEST", str(exc))
-
-
-@router.post("/rag/documents/pdf", response_model=DocumentIngestResponse)
-@router.post("/v1/rag/documents/pdf", response_model=DocumentIngestResponse)
-async def ingest_pdf_file(
-    file: UploadFile = File(...),
-    source: str | None = Form(default=None),
-    orchestrator: ChatOrchestrator = Depends(get_orchestrator),
-) -> DocumentIngestResponse | JSONResponse:
-    try:
-        data = await file.read()
-        chosen_source = (source or "").strip() or file.filename or "uploaded.pdf"
-        filename = file.filename or "uploaded.pdf"
-        return _with_retry(
-            lambda: orchestrator.ingest_pdf_bytes(source=chosen_source, filename=filename, pdf_bytes=data),
-            "INGEST_PDF",
-        )
-    except ValueError as exc:
-        return _error_response(400, "BAD_REQUEST", str(exc))
-
-
-@router.post("/rag/documents/pdf/path", response_model=DocumentIngestResponse)
-@router.post("/v1/rag/documents/pdf/path", response_model=DocumentIngestResponse)
-def ingest_pdf_path(
-    request: PdfPathIngestRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)
-) -> DocumentIngestResponse | JSONResponse:
-    try:
-        return _with_retry(
-            lambda: orchestrator.ingest_pdf_path(pdf_path=request.pdf_path, source=request.source),
-            "INGEST_PDF_PATH",
-        )
-    except ValueError as exc:
-        return _error_response(400, "BAD_REQUEST", str(exc))
 
 
 @router.get("/chat", response_model=None)

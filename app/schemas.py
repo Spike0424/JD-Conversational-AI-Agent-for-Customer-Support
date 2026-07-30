@@ -40,6 +40,14 @@ class ChatResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     need_handoff: bool = False
+    product_cards: list[dict] | None = Field(
+        default=None,
+        description="LLM 发送的商品卡片列表。前端检测到有值就渲染卡片。",
+    )
+    metadata: dict | None = Field(
+        default=None,
+        description="附加元数据（如 scene / scene_label），不直接展示给客户。",
+    )
 
 
 class HandoffRequest(BaseModel):
@@ -53,22 +61,6 @@ class HandoffResponse(BaseModel):
     ticket_id: str
     queue: str
     status: str = "queued"
-
-
-class DocumentIngestRequest(BaseModel):
-    source: str = Field(..., min_length=1, description="Document source name, file name, or user-provided label.")
-    content: str = Field(..., min_length=1, description="Document content to embed and add to the vector index.")
-
-
-class DocumentIngestResponse(BaseModel):
-    source: str
-    chunks_added: int
-    status: str = "indexed"
-
-
-class PdfPathIngestRequest(BaseModel):
-    pdf_path: str = Field(..., min_length=1, description="Absolute or relative PDF path on server.")
-    source: str | None = Field(default=None, description="Optional source label shown in citations.")
 
 
 class ErrorResponse(BaseModel):

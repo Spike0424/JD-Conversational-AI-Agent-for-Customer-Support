@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     search_synonym_expansions: dict[str, list[str]] = Field(
         default_factory=dict,
     )
+    search_stop_words: list[str] = Field(
+        default_factory=lambda: [
+            "多久", "什么", "怎么", "这个", "那个", "一下", "可以", "吗",
+            "呢", "啊", "呀", "哦", "嘛", "吧", "了", "的", "是", "在",
+            "有", "没有", "请问", "你好", "您好", "想", "要", "会", "能",
+        ],
+    )
     # ── 输出规范化配置 ──────────────────────────────────────────────
     output_filter_words: list[str] = Field(
         default_factory=lambda: [
@@ -85,6 +92,8 @@ class Settings(BaseSettings):
     prompt_dir: str = Field(default="./prompt", alias="PROMPT_DIR")
     log_rotation_mb: int = Field(default=10, alias="LOG_ROTATION_MB")
     log_retention_days: int = Field(default=7, alias="LOG_RETENTION_DAYS")
+    # ── 调试默认店铺 ──────────────────────────────────────────────────
+    default_shop_id: int | None = Field(default=None, alias="DEFAULT_SHOP_ID")
 
 
 @lru_cache

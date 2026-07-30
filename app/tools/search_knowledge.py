@@ -72,14 +72,62 @@ class SearchKnowledge:
         self._shop_id: int | None = None
         self._scene: str = "presale"
         self._goods_id: int | None = None
+        self._goods_name: str = ""
         self._settings = get_settings()
+        self._recent_user_messages: list[str] = []
+        self._tracker = None
 
     def set_context(
-        self, shop_id: int | None, scene: str = "presale", goods_id: int | None = None
+        self, shop_id: int | str | None, scene: str = "presale",
+        goods_id: int | None = None, goods_name: str = "",
     ) -> None:
-        self._shop_id = shop_id
+        self._shop_id = self._coerce_shop_id(shop_id)
         self._scene = scene
         self._goods_id = goods_id
+        self._goods_name = goods_name
+
+    def get_shop_id(self) -> int | None:
+        return self._shop_id
+
+    @staticmethod
+    def _coerce_shop_id(shop_id: int | str | None) -> int | None:
+        if shop_id is None:
+            return None
+        if isinstance(shop_id, int):
+            return shop_id
+        try:
+            return int(str(shop_id).strip())
+        except (ValueError, TypeError):
+            logger.warning("shop_id %r is not int-coercible; ignoring shop filter", shop_id)
+            return None
+
+    def set_history(self, recent_user_messages: list[str]) -> None:
+        self._recent_user_messages = recent_user_messages[-3:]
+
+    def set_tracker(self, tracker) -> None:
+        self._tracker = tracker
+
+    def _contextual_complete(self, query: str) -> str:
+        clean = query.strip()
+        if not clean:
+            return query
+        signal_terms = [t for t in re.split(r"[\s,，、；;]+", clean) if len(t) >= 2]
+        needs_context = (
+            len(clean) <= 6
+            or ("这款" in clean and len(clean) <= 14)
+            or len(signal_terms) <= 1
+        )
+        if not needs_context or not self._recent_user_messages:
+            return query
+        history_keywords: list[str] = []
+        for msg in self._recent_user_messages:
+            for m in re.finditer(r"[一-鿿]{2,}", msg):
+                kw = m.group()
+                if kw not in history_keywords and kw not in self._settings.search_stop_words:
+                    history_keywords.append(kw)
+        if not history_keywords:
+            return query
+        return f"{clean} {' '.join(history_keywords[:5])}"
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -110,15 +158,28 @@ class SearchKnowledge:
 
         return best_score
 
-    # ── search-term extraction ────────────────────────────────────
+    # ── search-term extraction (Layer 3: jieba + phrase + synonym - stop words) ──
 
     def _search_terms(self, query: str) -> list[str]:
         query_lower = query.lower()
         terms: list[str] = []
         term_lower_set: set[str] = set()
+        stop_words = set(getattr(self._settings, 'search_stop_words', []))
+
+        try:
+            import jieba
+            jieba_tokens = list(jieba.cut_for_search(query))
+        except Exception:
+            jieba_tokens = re.findall(r"[一-鿿]{2,}|[a-zA-Z]+|\d+", query)
+
+        for token in jieba_tokens:
+            token = token.strip()
+            if len(token) >= 2 and token not in stop_words and token.lower() not in term_lower_set:
+                terms.append(token)
+                term_lower_set.add(token.lower())
 
         for phrase in self._settings.search_phrase_candidates:
-            if phrase.lower() in query_lower:
+            if phrase.lower() in query_lower and phrase.lower() not in term_lower_set:
                 terms.append(phrase)
                 term_lower_set.add(phrase.lower())
 
@@ -154,39 +215,11 @@ class SearchKnowledge:
                 score += min(10 + count * 3, 25)
         return min(score, 120)
 
-    # ── keyword sub-scorers (TODO: implement per-field matching) ──
-
-    def _parameter_type_match_score(self, query: str, entry: dict) -> int:
-        return 0
-
-    def _version_name_match_score(self, query: str, entry: dict) -> int:
-        return 0
-
-    def _action_type_match_score(self, query: str, entry: dict) -> int:
-        return 0
-
-    def _complaint_type_match_score(self, query: str, entry: dict) -> int:
-        return 0
-
-    def _case_type_match_score(self, query: str, entry: dict) -> int:
-        return 0
-
     def _keyword_match_score(self, query: str, entry: dict) -> int:
         words = self._search_terms(query)
-        score = self._parameter_type_match_score(query, entry)
-        score += self._version_name_match_score(query, entry)
-        score += self._action_type_match_score(query, entry)
-        score += self._complaint_type_match_score(query, entry)
-        score += self._case_type_match_score(query, entry)
-        if words:
-            score += self._bm25_like_match_score(words, entry)
-        return score
-
-    # ── intent adjustment ─────────────────────────────────────────
-
-    def _intent_adjustment(self, sub_intent: str | None) -> int:
-        # TODO: weight by sub_intent category when rules are defined
-        return 0
+        if not words:
+            return 0
+        return self._bm25_like_match_score(words, entry)
 
     # ── goods_id consistency ──────────────────────────────────────
 
@@ -287,11 +320,10 @@ class SearchKnowledge:
         for i, entry in enumerate(candidates):
             alias_score = self._alias_match_score(query_clean, entry.get("aliases", ""))
             keyword_score = self._keyword_match_score(query, entry)
-            intent_score = self._intent_adjustment(entry.get("sub_intent"))
             goods_bonus = self._goods_id_bonus(entry.get("goods_id"))
             vector_sim = vector_scores[i]
 
-            rule_total = alias_score + keyword_score + intent_score + goods_bonus
+            rule_total = alias_score + keyword_score + goods_bonus
 
             if vector_sim >= _VECTOR_MATCH_THRESHOLD:
                 match_type = _MATCH_TYPE_HYBRID
@@ -304,7 +336,6 @@ class SearchKnowledge:
                 **entry,
                 "alias_score": alias_score,
                 "keyword_score": keyword_score,
-                "intent_score": intent_score,
                 "goods_bonus": goods_bonus,
                 "vector_similarity": round(vector_sim, 4),
                 "match_type": match_type,
@@ -333,6 +364,20 @@ class SearchKnowledge:
     # ── main search ───────────────────────────────────────────────
 
     def search(self, query: str, trace_id: str = "") -> str:
+        from app.orchestrator.request_state import RequestState
+
+        # Layer 2: contextual completion for short queries
+        query_before = query
+        query = self._contextual_complete(query)
+        # Layer 3: search terms
+        search_terms = self._search_terms(query)
+
+        if query != query_before:
+            logger.info("RAG query optimization: query=%r -> complete=%r -> terms=%s",
+                        query_before[:80], query[:80], search_terms)
+
+        if self._tracker:
+            self._tracker.transition(RequestState.RAG_QUERY_CLEANED, query=query[:50], terms=len(search_terms))
         tid = trace_id or uuid.uuid4().hex[:12]
         RAGLogger.log_query(tid, query)
 
@@ -355,6 +400,8 @@ class SearchKnowledge:
                 return f"[aftersale exact] {exact}"
 
         # ── Hybrid retrieval ──
+        if self._tracker:
+            self._tracker.transition(RequestState.RAG_FETCHING, scene=self._scene)
         candidates = self._fetch_candidates(
             shop_id=self._shop_id,
             scene=self._scene,
@@ -362,33 +409,26 @@ class SearchKnowledge:
         )
 
         if not candidates:
+            if self._tracker:
+                self._tracker.transition(RequestState.RAG_NO_HIT)
             label = _SCENE_LABELS.get(self._scene, self._scene)
-            return (
-                f"No {label} knowledge "
-                f"found for shop={self._shop_id} goods={self._goods_id}."
-            )
+            return f"No {label} knowledge found for shop={self._shop_id} goods={self._goods_id}."
 
+        if self._tracker:
+            self._tracker.transition(RequestState.RAG_RANKING, candidates=len(candidates))
         ranked = self._rank(query, candidates)
 
-        # ── Format results ──
+        # ── Format results for LLM (clean, no debug scores) ──
         lines: list[str] = []
-        top_n = min(len(ranked), 5)
+        top_n = min(len(ranked), 2)
         for i, r in enumerate(ranked[:top_n]):
-            tag = (
-                f"[{r['match_type']}]"
-                if r["match_type"] == _MATCH_TYPE_HYBRID
-                else f"[{_MATCH_TYPE_RULE}]"
-            )
             lines.append(
-                f"{tag} #{i + 1} score={r['final_score']:.1f} "
-                f"(alias={r['alias_score']} kw={r['keyword_score']} "
-                f"vec={r['vector_similarity']:.3f}) "
-                f"goods_id={r['goods_id']}\n"
-                f"  aliases: {r['aliases']}\n"
-                f"  answer: {r['answer'][:300]}"
+                f"## 知识条目 {i + 1}\n"
+                f"关键词：{r['aliases']}\n"
+                f"内容：{r['answer']}"
             )
 
-        header = f"[sub_scene={best} | {self._scene}] {len(ranked)} candidates, showing top {top_n}"
+        header = f"共找到 {len(ranked)} 条相关知识，以下是前 {top_n} 条："
 
         # ── Structured RAG trace log ──
         retrieval_hit = len(ranked) > 0 and ranked[0]["final_score"] > 0
@@ -399,21 +439,28 @@ class SearchKnowledge:
             scene=self._scene,
             shop_id=self._shop_id,
             goods_id=self._goods_id,
+            candidates_count=len(candidates),
+            ranked_count=len(ranked),
             filters={"shop_id": self._shop_id, "goods_id": self._goods_id, "scene": self._scene},
-            top_k=min(len(ranked), 5),
+            top_k=min(len(ranked), 2),
             retrieved_chunks=[
-                {"source": r.get("aliases", ""), "score": r.get("final_score", 0), "snippet": r.get("answer", "")[:200]}
-                for r in ranked[:5]
+                {"source": r.get("aliases", ""), "score": r.get("final_score", 0), "snippet": r.get("answer", "")}
+                for r in ranked[:2]
             ],
             rerank_result=[
                 {"rank": i + 1, "source": r.get("aliases", ""),
+                 "sub_intent": r.get("sub_intent", ""),
                  "match_type": r.get("match_type", ""), "final_score": r.get("final_score", 0),
                  "alias_score": r.get("alias_score", 0), "keyword_score": r.get("keyword_score", 0),
-                 "vector_similarity": r.get("vector_similarity", 0)}
-                for i, r in enumerate(ranked[:5])
+                 "vector_similarity": r.get("vector_similarity", 0),
+                 "goods_bonus": r.get("goods_bonus", 0)}
+                for i, r in enumerate(ranked[:2])
             ],
             retrieval_hit=retrieval_hit,
         )
+
+        if self._tracker:
+            self._tracker.transition(RequestState.RAG_RESULT_FORMATTED, top_k=min(len(ranked), 2))
 
         return header + "\n\n" + "\n\n".join(lines)
 

@@ -1,5 +1,7 @@
 import logging
 
+from sqlalchemy import select
+
 from app.business_models import AgentMessage
 from app.db import create_session, init_db
 
@@ -46,15 +48,30 @@ class SessionStore:
         max_items = limit or self._max_messages
         session = create_session()
         try:
-            rows = (
-                session.query(AgentMessage)
-                .filter(AgentMessage.session_id == session_id)
+            stmt = (
+                select(AgentMessage)
+                .where(AgentMessage.session_id == session_id)
                 .order_by(AgentMessage.id.desc())
                 .limit(max_items)
-                .all()
             )
+            rows = session.exec(stmt).scalars().all()
             # Reverse to chronological order
             return [{"role": r.role, "content": r.content or ""} for r in reversed(rows)]
+        finally:
+            session.close()
+
+    def recent_user_messages(self, session_id: str, n: int = 3) -> list[str]:
+        """Return the contents of the most recent `n` user messages (chronological order)."""
+        session = create_session()
+        try:
+            stmt = (
+                select(AgentMessage)
+                .where(AgentMessage.session_id == session_id, AgentMessage.role == "user")
+                .order_by(AgentMessage.id.desc())
+                .limit(n)
+            )
+            rows = session.exec(stmt).scalars().all()
+            return [r.content or "" for r in reversed(rows)]
         finally:
             session.close()
 
@@ -62,15 +79,16 @@ class SessionStore:
         """Return content of the most recent assistant message for dedup."""
         session = create_session()
         try:
-            row = (
-                session.query(AgentMessage)
-                .filter(
+            stmt = (
+                select(AgentMessage)
+                .where(
                     AgentMessage.session_id == session_id,
                     AgentMessage.role == "assistant",
                 )
                 .order_by(AgentMessage.id.desc())
-                .first()
+                .limit(1)
             )
+            row = session.exec(stmt).scalars().first()
             return row.content if row else None
         finally:
             session.close()

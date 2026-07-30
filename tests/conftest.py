@@ -1,10 +1,16 @@
 """Pytest 配置：默认注入假环境变量，避免依赖本机 .env；API 测试用 dependency_overrides 避免拉起真实 Agent。"""
 
-from unittest.mock import MagicMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.schemas import ChatResponse, DocumentIngestResponse
+from app.schemas import ChatResponse
+
+
+def run_async(coro):
+    """Run an async coroutine from a sync test (shared shim)."""
+    return asyncio.run(coro)
 
 
 @pytest.fixture(autouse=True)
@@ -22,17 +28,8 @@ def _default_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def orch_stub() -> MagicMock:
     o = MagicMock()
-    o.chat.return_value = ChatResponse(session_id="s", answer="stub-ok", citations=[])
+    o.chat = AsyncMock(return_value=ChatResponse(session_id="s", answer="stub-ok", citations=[]))
     o.stream_chat.return_value = ("t1", "general_qa", [], [], iter(()))
-    o.ingest_document.return_value = DocumentIngestResponse(source="doc.txt", chunks_added=1)
-    o.ingest_pdf_bytes.side_effect = lambda source, filename, pdf_bytes: DocumentIngestResponse(
-        source=source,
-        chunks_added=2,
-    )
-    o.ingest_pdf_path.side_effect = lambda pdf_path, source=None: DocumentIngestResponse(
-        source=source or pdf_path,
-        chunks_added=2,
-    )
     o.handoff.return_value = MagicMock()
     return o
 

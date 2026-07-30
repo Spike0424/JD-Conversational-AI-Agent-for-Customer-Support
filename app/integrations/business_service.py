@@ -1,4 +1,4 @@
-import time
+import asyncio
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -38,7 +38,7 @@ class BusinessService:
         self._retries = max(0, settings.business_api_retries)
         self._headers = {"X-API-Key": settings.business_api_key} if settings.business_api_key else {}
 
-    def _request(self, base_url: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _request(self, base_url: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if not base_url.strip():
             raise BusinessAPIError("BACKEND_NOT_CONFIGURED", "Business backend base URL is not configured.")
 
@@ -46,8 +46,8 @@ class BusinessService:
         last_error: Exception | None = None
         for attempt in range(self._retries + 1):
             try:
-                with httpx.Client(timeout=self._timeout, headers=self._headers) as client:
-                    response = client.request(method=method, url=url, json=payload)
+                async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
+                    response = await client.request(method=method, url=url, json=payload)
                 response.raise_for_status()
                 data = response.json()
                 if not isinstance(data, dict):
@@ -57,19 +57,19 @@ class BusinessService:
                 last_error = exc
                 if attempt >= self._retries:
                     raise BusinessAPIError("BACKEND_TIMEOUT", "Business backend request timed out.") from exc
-                time.sleep(0.2 * (attempt + 1))
+                await asyncio.sleep(0.2 * (attempt + 1))
             except httpx.HTTPStatusError as exc:
                 raise BusinessAPIError("BACKEND_HTTP_ERROR", f"HTTP {exc.response.status_code} from backend.") from exc
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt >= self._retries:
                     raise BusinessAPIError("BACKEND_UNAVAILABLE", "Business backend request failed.") from exc
-                time.sleep(0.2 * (attempt + 1))
+                await asyncio.sleep(0.2 * (attempt + 1))
         raise BusinessAPIError("BACKEND_UNAVAILABLE", str(last_error) if last_error else "Unknown backend error.")
 
-    def search_products(self, category: str, budget_min: int, budget_max: int) -> BusinessResult:
+    async def search_products(self, category: str, budget_min: int, budget_max: int) -> BusinessResult:
         if self._settings.crm_base_url.strip():
-            data = self._request(
+            data = await self._request(
                 base_url=self._settings.crm_base_url,
                 method="POST",
                 path="/products/search",
@@ -91,9 +91,9 @@ class BusinessService:
             message="CRM_BASE_URL not configured; using mock data.",
         )
 
-    def get_order_status(self, order_id: str) -> BusinessResult:
+    async def get_order_status(self, order_id: str) -> BusinessResult:
         if self._settings.oms_base_url.strip():
-            data = self._request(
+            data = await self._request(
                 base_url=self._settings.oms_base_url,
                 method="GET",
                 path=f"/orders/{order_id}",
@@ -114,13 +114,13 @@ class BusinessService:
             message="OMS_BASE_URL not configured; using mock data.",
         )
 
-    def check_warranty(self, sn_or_imei: str) -> BusinessResult:
+    async def check_warranty(self, sn_or_imei: str) -> BusinessResult:
         token = sn_or_imei.strip().upper()
         if not token:
             return BusinessResult(status="error", code="INVALID_WARRANTY_TOKEN", message="Empty serial/IMEI.")
 
         if self._settings.aftersale_base_url.strip():
-            data = self._request(
+            data = await self._request(
                 base_url=self._settings.aftersale_base_url,
                 method="GET",
                 path=f"/warranty/{token}",
@@ -139,7 +139,7 @@ class BusinessService:
             message="AFTERSALE_BASE_URL not configured; using mock data.",
         )
 
-    def create_after_sale_ticket(self, order_id: str, issue_type: str, details: str = "") -> BusinessResult:
+    async def create_after_sale_ticket(self, order_id: str, issue_type: str, details: str = "") -> BusinessResult:
         oid = order_id.strip().upper()
         issue = issue_type.strip()
         if not oid or not issue:
@@ -150,7 +150,7 @@ class BusinessService:
             )
 
         if self._settings.aftersale_base_url.strip():
-            data = self._request(
+            data = await self._request(
                 base_url=self._settings.aftersale_base_url,
                 method="POST",
                 path="/tickets",

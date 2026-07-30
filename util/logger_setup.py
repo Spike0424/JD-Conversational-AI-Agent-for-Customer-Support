@@ -12,14 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
-_RESET = "\033[0m"
-_COLORS: dict[int, str] = {
-    logging.DEBUG: "\033[36m",
-    logging.INFO: "\033[32m",
-    logging.WARNING: "\033[33m",
-    logging.ERROR: "\033[31m",
-    logging.CRITICAL: "\033[41m\033[37m",
-}
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -125,14 +118,6 @@ class _CleanupRotatingFileHandler(logging.handlers.RotatingFileHandler):
             pass
 
 
-class _ColoredFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        color = _COLORS.get(record.levelno, "")
-        if color:
-            record.levelname = f"{color}{record.levelname}{_RESET}"
-        return super().format(record)
-
-
 _UVICORN_LOGGERS = ["uvicorn", "uvicorn.error", "uvicorn.access"]
 
 
@@ -203,8 +188,7 @@ def setup_logging(app_env: _EnvName | None = None) -> None:
     if config["console"]:
         console = logging.StreamHandler(sys.stderr)
         console.setLevel(config["console_level"])
-        fmt_cls = _ColoredFormatter if config.get("console_colored") else logging.Formatter
-        console.setFormatter(fmt_cls(config["console_format"]))
+        console.setFormatter(logging.Formatter(config["console_format"]))
         root.addHandler(console)
         handlers.append(console)
 
@@ -238,3 +222,10 @@ def setup_logging(app_env: _EnvName | None = None) -> None:
         config["retention_days"],
         config["compress"],
     )
+
+    # Suppress noisy 3rd-party loggers
+    for _noisy in (
+        "watchfiles.main", "watchfiles", "httpcore", "httpx",
+        "openai", "openai._base_client", "openai.api_requestor",
+    ):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
