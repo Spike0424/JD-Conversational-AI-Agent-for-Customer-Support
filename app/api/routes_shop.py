@@ -2,9 +2,10 @@
 
 import logging
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from sqlalchemy import or_
 
+from app.api.rate_limit import limiter
 from app.business_models import ProductKnowledge, Shop
 from app.db import create_session
 from app.schemas import ProductInfo, ShopInfo
@@ -29,7 +30,9 @@ def list_shops() -> list[ShopInfo]:
 
 
 @router.get("/v1/products", response_model=list[ProductInfo])
+@limiter.limit("30/minute")
 def search_products(
+    request: Request,
     shop_id: int = Query(..., description="店铺 ID（必填）"),
     q: str = Query("", description="搜索关键词（商品名模糊匹配）"),
     limit: int = Query(20, ge=1, le=50, description="返回条数上限"),
