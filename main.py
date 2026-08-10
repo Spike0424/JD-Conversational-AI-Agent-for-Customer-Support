@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from app.api.deps import get_orchestrator
 from app.api.routes_admin import router as admin_router
 from app.api.routes_chat import router as chat_router
+from app.api.routes_shop import router as shop_router
 from util.logger_setup import setup_logging
 
 setup_logging()
@@ -21,6 +22,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LangChain ReAct QA Agent", version="0.1.0", lifespan=lifespan)
 app.include_router(chat_router)
 app.include_router(admin_router)
+app.include_router(shop_router)
 
 
 @app.get("/health")
