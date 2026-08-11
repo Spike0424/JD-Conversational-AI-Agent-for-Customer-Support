@@ -38,7 +38,7 @@ export function ChatRoom({ sessionId, context, goodsName, onNewConversation }: P
         history: messages,
         onChunk: (delta) => {
           appendAssistantChunk(delta)
-          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight })
         },
         signal: ctrl.signal,
       })

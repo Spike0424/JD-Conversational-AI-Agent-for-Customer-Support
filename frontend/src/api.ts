@@ -59,17 +59,18 @@ export async function streamChat(opts: {
       if (!line.startsWith('data: ')) continue
       const payload = line.slice(6)
       if (payload === '[DONE]') continue
+      let msg
       try {
-        const msg = JSON.parse(payload)
-        if (msg.delta) {
-          answer += msg.delta
-          onChunk(msg.delta)
-        }
-        if (msg.error_code) {
-          throw new Error(msg.message || 'stream error')
-        }
-      } catch (e) {
-        // partial JSON in buffer, skip - will be completed in next chunk
+        msg = JSON.parse(payload)
+      } catch {
+        continue  // partial JSON in buffer, wait for next chunk
+      }
+      if (msg.delta) {
+        answer += msg.delta
+        onChunk(msg.delta)
+      }
+      if (msg.error_code) {
+        throw new Error(msg.message || 'stream error')
       }
     }
   }
