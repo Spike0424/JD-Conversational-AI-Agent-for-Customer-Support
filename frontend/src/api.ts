@@ -1,4 +1,4 @@
-import type { ChatContext, ChatMessage, ProductInfo, ShopInfo } from './types'
+import type { ChatContext, ProductInfo, ShopInfo } from './types'
 
 const API_BASE = ''  // same-origin in production; Vite proxy in dev
 
@@ -23,7 +23,6 @@ export async function streamChat(opts: {
   sessionId: string
   question: string
   context: ChatContext
-  history: ChatMessage[]
   onChunk: (delta: string) => void
   signal?: AbortSignal
 }): Promise<{ answer: string }> {

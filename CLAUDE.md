@@ -13,6 +13,10 @@ uv run .venv/bin/pytest tests/test_X.py -q # single test file
 uv run .venv/bin/pytest -k name -q         # tests matching name
 PGPASSWORD=pg2024 psql -h 127.0.0.1 -p 5434 -U postgres -d jd_agent -c "..."  # DB inspect
 uv run python script/seed_*.py             # seed data (orders, knowledge, mock)
+cd frontend && npm install                 # frontend deps
+cd frontend && npm run dev                 # Vite dev server on :5173 (proxy /v1 -> :8000)
+cd frontend && npm run build               # build to frontend/dist/ (FastAPI serves it)
+cd frontend && npx tsc --noEmit            # TS type check
 ```
 
 No separate lint/format step (project doesn't configure one).
@@ -106,6 +110,24 @@ SQLModel ORM (`app/business_models.py`) on PostgreSQL with pgvector extension. K
 
 Endpoints: `turn-context/dry-run` (POST), `context/validate` (POST), `sessions/{sid}` (GET), `scene-cache/clear` (POST), `context-types` (GET).
 
+### Public shop/product endpoints (chat frontend)
+
+`app/api/routes_shop.py` exposes 2 public endpoints (no auth, IP rate-limited via `slowapi`):
+- `GET /v1/shops` - list all shops (for the form's shop selector)
+- `GET /v1/products?shop_id=X&q=Y` - search products by name (for the form's product picker)
+
+Rate limits configured in `app/api/rate_limit.py`: `/v1/products` 30/min, `/v1/chat/stream` 10/min per IP. `main.py` registers the limiter via `app.state.limiter` + `RateLimitExceeded` exception handler.
+
+### Frontend (standalone React SPA)
+
+`frontend/` is a Vite + React 18 + TypeScript + Ant Design 5 app. Build with `cd frontend && npm run build` -> `frontend/dist/`. FastAPI mounts `dist/` as `StaticFiles` at `/` (same-origin, zero CORS) — see `main.py` lines 41-43.
+
+Dev workflow:
+- Backend: `uv run uvicorn main:app --reload` (port 8000)
+- Frontend dev: `cd frontend && npm run dev` (port 5173, Vite proxy `/v1/*` -> :8000)
+
+Architecture: form-first flow. `ConsultationForm` collects shop + product + optional order_sn, then `ChatRoom` streams via `POST /v1/chat/stream` (SSE via `fetch` + `ReadableStream`). Session ID (UUID) and message history persisted in browser `localStorage`.
+
 ## Workflow Rules
 
 - **Auto-sync docs**: After modifying code, refactoring logic, adding APIs, or changing architecture, evaluate and update `CLAUDE.md` so its project structure, command reference, and conventions stay consistent with the current codebase.
@@ -121,6 +143,8 @@ Endpoints: `turn-context/dry-run` (POST), `context/validate` (POST), `sessions/{
 | Change system prompt for a scene | `prompt/{scene}.md` |
 | Add a tool for the agent | `app/tools/*.py` with `@agent_tool` decorator |
 | Add an admin endpoint | `app/api/routes_admin.py` (auto-protected by bearer token) |
+| Add a public endpoint | `app/api/routes_shop.py` (rate-limited via `app/api/rate_limit.py`) |
+| Tune frontend chat UI | `frontend/src/components/*.tsx` (ChatRoom / ConsultationForm / MessageBubble) |
 | Tune 4-layer fallback | `app/llm/agent_runtime.py` `ask()` / `ask_stream()` (async) |
 | Tune message building / history compression | `app/llm/input_builder.py` (async: `build_input_messages` / `_compress_history`) |
 | Tune request state tracking / logging | `app/orchestrator/request_state.py` (`RequestTracker.transition`) |
