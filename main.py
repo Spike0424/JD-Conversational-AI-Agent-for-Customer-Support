@@ -38,6 +38,6 @@ def health() -> dict[str, str]:
 
 
 # Serve frontend SPA (must be after all /v1/* routes to avoid shadowing them)
-_frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+_frontend_dist = Path(__file__).parent / "frontend" / "dist"
 if _frontend_dist.exists():
     app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="frontend")
