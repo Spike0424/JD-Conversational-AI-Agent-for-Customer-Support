@@ -1,9 +1,34 @@
+import { useState } from 'react'
+import { ConfigProvider } from 'antd'
+import zhCN from 'antd/locale/zh_CN'
+import { ChatRoom } from './components/ChatRoom'
+import { ConsultationForm, formStateToContext, type FormState } from './components/ConsultationForm'
+import { useSession } from './hooks/useSession'
+
 function App() {
+  const { sessionId, newSession } = useSession()
+  const [formState, setFormState] = useState<FormState | null>(null)
+
+  if (!formState) {
+    return (
+      <ConfigProvider locale={zhCN}>
+        <ConsultationForm onStart={(s) => setFormState(s)} />
+      </ConfigProvider>
+    )
+  }
+
   return (
-    <div style={{ padding: 24, fontFamily: 'system-ui' }}>
-      <h1>客服聊天页（脚手架）</h1>
-      <p>后端 API: <a href="/v1/shops">/v1/shops</a></p>
-    </div>
+    <ConfigProvider locale={zhCN}>
+      <ChatRoom
+        sessionId={sessionId}
+        context={formStateToContext(formState)}
+        goodsName={formState.goodsName}
+        onNewConversation={() => {
+          newSession()
+          setFormState(null)
+        }}
+      />
+    </ConfigProvider>
   )
 }
 
