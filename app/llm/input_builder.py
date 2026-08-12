@@ -7,12 +7,14 @@ history compression, user persistence, and the combined message construction.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
 from typing import Any
 
 from app.config import Settings
+from app.llm.retry import ainvoke_with_network_retry
 from app.llm.token_counter import count_tokens
 from app.session_store import SessionStore
 
@@ -158,7 +160,9 @@ class InputBuilder:
         dependencies: dict | None = None,
     ) -> list[dict[str, str]]:
         """Assemble the full message list sent to the LLM on each turn."""
-        system_prompt = self.load_scene_prompt(scene) + self.format_session_info(dependencies)
+        system_prompt = self.load_scene_prompt(scene)
+        system_prompt = await self._fill_db_placeholders(system_prompt, scene, dependencies)
+        system_prompt += self.format_session_info(dependencies)
         history = self._session_store.load(session_id=session_id)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
@@ -171,6 +175,51 @@ class InputBuilder:
             session_id, scene, len(system_prompt), len(history), question,
         )
         return result
+
+    async def _fill_db_placeholders(
+        self, prompt: str, scene: str, dependencies: dict | None
+    ) -> str:
+        """Replace [DB_*] placeholders with actual KB data before sending to LLM.
+
+        Empty placeholders are blanked out so the LLM doesn't try to fill them
+        by calling search_knowledge.  KB queries run in parallel via to_thread.
+        """
+        if "[DB_" not in prompt:
+            return prompt
+
+        shop_id = (dependencies or {}).get("shop_id")
+        goods_id = (dependencies or {}).get("goods_id")
+
+        shop_text = ""
+        product_text = ""
+        if shop_id and scene:
+            from app.tools.search_knowledge import get_search_knowledge
+
+            sk = get_search_knowledge()
+            if sk:
+                tasks = []
+                if goods_id:
+                    tasks.append(asyncio.to_thread(sk.fetch_product_knowledge, shop_id, scene, goods_id))
+                else:
+                    tasks.append(asyncio.to_thread(lambda: ""))
+                tasks.append(asyncio.to_thread(sk.fetch_shop_advantages, shop_id, scene))
+                try:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    if goods_id:
+                        product_text = results[0] if isinstance(results[0], str) else ""
+                        shop_text = results[1] if isinstance(results[1], str) else ""
+                    else:
+                        shop_text = results[0] if isinstance(results[0], str) else ""
+                except Exception:
+                    logger.exception("KB placeholder fill failed shop=%s scene=%s", shop_id, scene)
+
+        return (
+            prompt
+            .replace("[DB_SHOP_ADVANTAGES]", shop_text)
+            .replace("[DB_PRODUCT_KNOWLEDGE]", product_text)
+            .replace("[DB_SHIPPING_POLICY]", "")
+            .replace("[DB_HOT_MODELS_RECOMMENDATION]", "")
+        )
 
     async def _compress_history(
         self, messages: list[dict[str, str]], session_id: str
@@ -214,10 +263,15 @@ class InputBuilder:
         compress_prompt = f"请总结以下对话历史，保留关键信息：\n\n{old_text}"
 
         try:
-            summary_msg = await self._agens_llm.ainvoke([
-                {"role": "system", "content": AGENS_SYSTEM_PROMPT},
-                {"role": "user", "content": compress_prompt},
-            ])
+            summary_msg = await ainvoke_with_network_retry(
+                self._agens_llm,
+                [
+                    {"role": "system", "content": AGENS_SYSTEM_PROMPT},
+                    {"role": "user", "content": compress_prompt},
+                ],
+                self._settings.network_retries,
+                "Agens",
+            )
             summary = (
                 getattr(summary_msg, "content", "")
                 if hasattr(summary_msg, "content")

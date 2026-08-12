@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 import uuid
 from typing import Optional, Union
 
@@ -76,6 +77,8 @@ class SearchKnowledge:
         self._settings = get_settings()
         self._recent_user_messages: list[str] = []
         self._tracker = None
+        self._shop_cache: dict[tuple[int, str], tuple[float, str]] = {}
+        self._product_cache: dict[tuple[int, str, int], tuple[float, str]] = {}
 
     def set_context(
         self, shop_id: int | str | None, scene: str = "presale",
@@ -233,9 +236,11 @@ class SearchKnowledge:
     # ── data fetching ─────────────────────────────────────────────
 
     def _fetch_candidates(
-        self, shop_id: int, scene: str, goods_id: int | None
+        self, shop_id: int, scene: str, goods_id: int | None,
+        product_only: bool = False,
     ) -> list[dict]:
-        """Fetch product-specific + shop-general knowledge in a single query."""
+        """Fetch knowledge entries. By default returns product-specific + shop-general
+        when goods_id is given; pass product_only=True to exclude shop-general rows."""
         table = _SCENE_TABLE.get(scene, PresaleKnowledge)
         session = create_session()
         try:
@@ -246,9 +251,12 @@ class SearchKnowledge:
                 table.enabled == True,
             ]
             if goods_id is not None:
-                filters.append(
-                    or_(table.goods_id == goods_id, table.goods_id.is_(None))
-                )
+                if product_only:
+                    filters.append(table.goods_id == goods_id)
+                else:
+                    filters.append(
+                        or_(table.goods_id == goods_id, table.goods_id.is_(None))
+                    )
             else:
                 filters.append(table.goods_id.is_(None))
 
@@ -274,6 +282,51 @@ class SearchKnowledge:
             return []
         finally:
             session.close()
+
+    # ── prompt injection (pre-RAG) ─────────────────────────────────
+
+    @staticmethod
+    def _format_for_prompt(entries: list[dict]) -> str:
+        """Format KB entries as a bullet list for system-prompt injection."""
+        if not entries:
+            return ""
+        lines: list[str] = []
+        for e in entries:
+            aliases = (e.get("aliases") or "").strip()
+            answer = (e.get("answer") or "").strip()
+            if not answer:
+                continue
+            if aliases:
+                lines.append(f"- 【{aliases}】{answer}")
+            else:
+                lines.append(f"- {answer}")
+        return "\n".join(lines)
+
+    _PRE_RAG_CACHE_TTL = 60.0
+
+    def fetch_shop_advantages(self, shop_id: int, scene: str) -> str:
+        """Shop-general knowledge (goods_id IS NULL) for [DB_SHOP_ADVANTAGES] placeholder. Cached 60s."""
+        key = (shop_id, scene)
+        now = time.time()
+        cached = self._shop_cache.get(key)
+        if cached and now - cached[0] < self._PRE_RAG_CACHE_TTL:
+            return cached[1]
+        result = self._format_for_prompt(self._fetch_candidates(shop_id, scene, goods_id=None))
+        self._shop_cache[key] = (now, result)
+        return result
+
+    def fetch_product_knowledge(self, shop_id: int, scene: str, goods_id: int) -> str:
+        """Product-specific knowledge (goods_id == current) for [DB_PRODUCT_KNOWLEDGE] placeholder. Cached 60s."""
+        key = (shop_id, scene, goods_id)
+        now = time.time()
+        cached = self._product_cache.get(key)
+        if cached and now - cached[0] < self._PRE_RAG_CACHE_TTL:
+            return cached[1]
+        result = self._format_for_prompt(
+            self._fetch_candidates(shop_id, scene, goods_id=goods_id, product_only=True)
+        )
+        self._product_cache[key] = (now, result)
+        return result
 
     # ── vector semantic scoring ───────────────────────────────────
 
@@ -431,6 +484,7 @@ class SearchKnowledge:
         header = f"共找到 {len(ranked)} 条相关知识，以下是前 {top_n} 条："
 
         # ── Structured RAG trace log ──
+        # top_k is what the LLM sees; logger records ALL ranked candidates for debugging/eval.
         retrieval_hit = len(ranked) > 0 and ranked[0]["final_score"] > 0
         RAGLogger.log_trace(
             tid,
@@ -445,7 +499,7 @@ class SearchKnowledge:
             top_k=min(len(ranked), 2),
             retrieved_chunks=[
                 {"source": r.get("aliases", ""), "score": r.get("final_score", 0), "snippet": r.get("answer", "")}
-                for r in ranked[:2]
+                for r in ranked
             ],
             rerank_result=[
                 {"rank": i + 1, "source": r.get("aliases", ""),
@@ -454,7 +508,7 @@ class SearchKnowledge:
                  "alias_score": r.get("alias_score", 0), "keyword_score": r.get("keyword_score", 0),
                  "vector_similarity": r.get("vector_similarity", 0),
                  "goods_bonus": r.get("goods_bonus", 0)}
-                for i, r in enumerate(ranked[:2])
+                for i, r in enumerate(ranked)
             ],
             retrieval_hit=retrieval_hit,
         )
