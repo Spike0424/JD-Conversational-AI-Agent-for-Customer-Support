@@ -1,154 +1,72 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code working in this repository.
+
+## What this is
+
+京东第三方商家 AI 客服 agent：FastAPI 后端 + React SPA 前端。Agent 通过 `Context` payload 感知商品页上下文（shop_id / goods_id / order_sn / media 等），用混合检索（alias + keyword + vector）+ LLM 单轮工具调用回答售前/售中/售后问题。
 
 ## Commands
 
 ```bash
-uv sync                                    # install deps
-uv run uvicorn main:app --reload           # start FastAPI on :8000
-uv run chainlit run chainlit_app.py -w     # start Chainlit chat UI
-uv run .venv/bin/pytest -q                 # full test suite
-uv run .venv/bin/pytest tests/test_X.py -q # single test file
-uv run .venv/bin/pytest -k name -q         # tests matching name
-PGPASSWORD=pg2024 psql -h 127.0.0.1 -p 5434 -U postgres -d jd_agent -c "..."  # DB inspect
-uv run python script/seed_*.py             # seed data (orders, knowledge, mock)
+uv sync                                       # install backend deps
+uv run uvicorn main:app --reload              # FastAPI :8000
+uv run .venv/bin/pytest -q                    # tests
+PGPASSWORD=pg2024 psql -h 127.0.0.1 -p 5434 -U postgres -d jd_agent -c "..."  # DB
+cd frontend && npm install && npm run dev     # Vite :5173 (proxy /v1 -> :8000)
+cd frontend && npm run build                  # build to frontend/dist/ (FastAPI serves it)
 ```
-
-No separate lint/format step (project doesn't configure one).
 
 ## Architecture
 
-### Request flow
-
 ```
 HTTP (FastAPI)
-  -> routes_chat.py / routes_admin.py
+  -> routes_chat.py / routes_admin.py / routes_shop.py
   -> ChatOrchestrator (app/orchestrator/service.py)
-    ├─ scene_classifier.py      # presale / insale / aftersale / mixed via order data
-    ├─ turn_context.py          # parse raw turn -> ProductCard / OrderCard / MediaInfo
-    ├─ request_state.py         # RequestTracker / RequestState state machine (per-request logging)
-    ├─ agent_runtime.py         # Direct LLM + bind_tools single-round (no ReAct loop)
-    │    ├─ input_builder.py    # scene prompt + history compression + session-info formatting
+    ├─ turn_context.py        # parse raw turn -> ProductCard / OrderCard / MediaInfo
+    ├─ scene_classifier.py    # presale / insale / aftersale / mixed via orders table
+    ├─ request_state.py       # RequestTracker state machine (per-request logging)
+    ├─ agent_runtime.py       # LLM + bind_tools single-round (no ReAct loop)
+    │    ├─ input_builder.py  # scene prompt + history compression + session-info
     │    └─ tools/search_knowledge.py   # hybrid retrieval (alias + keyword + vector)
-    └─ session_store.py         # agent_messages table (SQLModel)
+    └─ session_store.py       # agent_messages table
 ```
 
-The orchestrator (`ChatOrchestrator.chat`) branches on `Context.type` before scene classification:
-- `is_silent` (withdraw / auth / system_biz / system_status / mall_system_msg) -> empty answer
-- `requires_human` (image / video) -> `{actions: ["transfer_to_human"], need_handoff: True}`
-- `goods_card` + no customer text -> `_WELCOME_MESSAGE` if first turn (no prior user messages), else "您想了解这款商品的哪方面呢？"
-- greeting (`_is_greeting` matches hi/hello/你好/在吗/...) -> `_WELCOME_MESSAGE`, skip scene classifier and LLM
-- otherwise -> scene classifier + agent
+`ChatOrchestrator.chat` branches on `Context.type` before LLM：silent（withdraw/system）-> 空答；image/video -> transfer_to_human；goods_card 无文字 -> 欢迎语；greeting -> 欢迎语跳过 LLM；否则走 scene classifier + agent。`main.py` lifespan 里 `prewarm()` 预热 embedding 模型和 DB pool。
 
-`main.py` `lifespan` calls `orchestrator._agent.prewarm()` at startup to warm the embedding model and DB pool.
+**4 层空答兜底**（`agent_runtime.py::ask` / `ask_stream`）：L1 重试 + nudge -> L2 KB 检索 -> L3 默认回复 -> L4 空答不入历史。**3 层 API 错误兜底**（`_call_llm_ainvoke`）：4xx 直接 ClientError / 5xx 重试 2 次换 fallback 模型 / 网络错误指数退避重试 3 次。共享工具在 `app/llm/retry.py`。
 
-### Embedded shop page model
+**Pre-RAG 占位符填充**（`input_builder.py::_fill_db_placeholders`）：发 LLM 前把 prompt 里的 `[DB_SHOP_ADVANTAGES]` / `[DB_PRODUCT_KNOWLEDGE]` 占位符替换成 KB 数据，避免 LLM 为填占位符多余调 `search_knowledge`。`SearchKnowledge.fetch_shop_advantages` / `fetch_product_knowledge` 60s TTL 缓存。
 
-The agent is designed to be embedded in product shop pages. Frontend sends a `Context` payload (`app/context_models.py`) alongside each turn with: `shop_id`, `shop_name`, `goods_id`, `goods_name`, `order_sn`, `media_url`, `context_type`, `channel_type`. The orchestrator parses raw text via `parse_turn_context()` to extract the clean customer message, then injects a `【当前会话信息】` block into the LLM system prompt (`InputBuilder.format_session_info`).
+## Endpoints
 
-All platform-provided values are run through `InputBuilder.safe_value()` (`app/llm/input_builder.py`) which wraps them in `<input>...</input>` tags and doubles braces - this is prompt-injection defense, not decoration. Don't bypass it.
+| 类型 | 路由 | 说明 |
+|------|------|------|
+| Chat | `POST /v1/chat` / `/v1/chat/stream` | 流式用 SSE（`fetch` + `ReadableStream`） |
+| Public | `GET /v1/shops` / `/v1/products` | 前端表单用，slowapi IP 限流（30/min, 10/min） |
+| Admin | `/v1/admin/*` | `routes_admin.py`，bearer token 鉴权 |
 
-### Hybrid retrieval
+## Frontend
 
-`SearchKnowledge` (in `app/tools/search_knowledge.py`) ranks candidates by combining:
-1. **Alias match** (`_alias_match_score`, highest weight ~240) - splits aliases on `/|;；\n\r` and matches against normalized query
-2. **Keyword score** (`_keyword_match_score`) - BM25-like scoring across `aliases + answer + tags + product_family + section_title`
-3. **Vector similarity** (BAAI/bge-small-zh-v15 via fastembed) - `>=0.45` threshold promotes to "hybrid" match_type
-4. **Goods ID bonus** - `+50` if entry's `goods_id == current`, `-30` if mismatch
-
-Set context via `set_context(shop_id, scene, goods_id, goods_name="")` before each call. `set_history(recent_user_messages)` enables Layer 2 contextual completion.
-
-### 3-layer query optimization
-
-`SearchKnowledge.search()` applies 3 layers before retrieval:
-1. **Clean** (`_clean_query`): strip metadata markers from raw query
-2. **Contextual complete** (`_contextual_complete`): for short/follow-up queries, append keywords from recent history
-3. **Search terms** (`_search_terms`): jieba tokenization + phrase matching + synonym expansion + stop word removal
-
-Result is also written to `RAGLogger` (see `app/evaluation/rag_logger.py`).
-
-### Scene classification
-
-`SceneClassifier` (in `app/orchestrator/scene_classifier.py`) queries the `orders` table (via psycopg2 connection pool) for the user's recent orders, then derives scene:
-- no orders -> `presale`
-- all orders signed (`arr_time IS NOT NULL`) -> `aftersale`
-- mix of signed + unsigned -> `scene_hint=mixed_orders`, scene=`insale`, but the orchestrator then re-routes to `mixed` prompt that asks for order number
-- 30-minute in-memory cache keyed by `session_id`
-
-`SceneClassifier.last_scene_hint` is the side-channel for orchestrator to detect mixed.
-
-### Empty-answer fallback (4-layer)
-
-In `ReActQAAgent.ask()` / `ask_stream()` (both `async def`, accept `tracker: RequestTracker | None`):
-1. **L1 silent retry** - re-call with exponential backoff + system-message nudge if answer is empty
-2. **L2 knowledge-base fallback** - `_fallback_to_knowledge_base()` calls `SearchKnowledge.search()` and prefixes with "以下是根据知识库检索到的相关信息"; `_resolve_fallback_answer()` is the shared L2->L3 path for both `ask()` and `ask_stream()`
-3. **L3 default reply** - "抱歉，我暂时无法回答，请换个问题或稍后再试"
-4. **L4 history purification** - empty answer is NOT persisted to `agent_messages` to avoid polluting future context
-
-In `app/evaluation/generation_metrics.py::_judge()`: wraps `judge_llm.ainvoke()` (async) in try/except; one transient API failure does not abort the batch.
-
-### API error handling (3-tier)
-
-LLM calls (`_call_llm_ainvoke` / `_call_llm_astream` in `app/llm/agent_runtime.py`) classify exceptions into 3 tiers. Shared retry utilities (`NETWORK_EXC`, `backoff_delay`) live in `app/llm/retry.py`.
-
-1. **4xx (except 429)** - raise `ClientError`, no retry, no fallback. `ask()` / `ask_stream()` catch it and return `_CLIENT_ERROR_MESSAGE` ("抱歉，服务器暂时出现了点问题，请稍后再试。"). `routes_chat.py` also catches `ClientError` in `_with_retry_async` (returns 502) and `event_stream()` (yields SSE error event).
-2. **5xx / 429 (supplier)** - retry `SUPPLIER_RETRIES` (default 2) times with backoff+jitter on the same model; on exhaustion switch to the fallback model (different provider, configured via `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL_NAME`). Fallback gets tier-3 network retry but not tier-2 5xx retry.
-3. **Network errors** (`openai.APITimeoutError` / `APIConnectionError` / `httpx.TimeoutException` / `ConnectError`) - retry `NETWORK_RETRIES` (default 3) times with exponential backoff + jitter (`backoff_delay` in `app/llm/retry.py`).
-
-Streaming only retries before the first event; mid-stream errors are logged and yield `_CLIENT_ERROR_MESSAGE` to the client (cannot retry once chunks have been sent).
-
-### Pre-RAG prompt placeholder filling
-
-`InputBuilder._fill_db_placeholders()` (`app/llm/input_builder.py`) replaces `[DB_SHOP_ADVANTAGES]` and `[DB_PRODUCT_KNOWLEDGE]` placeholders in scene prompts with actual KB data before sending to the LLM. This prevents the LLM from calling `search_knowledge` just to fill empty placeholders.
-
-- `[DB_SHOP_ADVANTAGES]` <- `SearchKnowledge.fetch_shop_advantages(shop_id, scene)` (entries with `goods_id IS NULL`)
-- `[DB_PRODUCT_KNOWLEDGE]` <- `SearchKnowledge.fetch_product_knowledge(shop_id, scene, goods_id)` (entries with `goods_id == current`)
-- `[DB_SHIPPING_POLICY]` and `[DB_HOT_MODELS_RECOMMENDATION]` are blanked to `""` (their content is covered by `[DB_SHOP_ADVANTAGES]` or needs separate query; update `prompt/presales.md` if you want the LLM to stop referencing them).
-
-### Query rewriting
-
-`ChatOrchestrator._rewrite_question()` (`app/orchestrator/service.py`) replaces vague references like "这手机" / "这款手机" / "该手机" with the actual `goods_name` from `deps`, so the LLM gets a clearer question and doesn't split intent. Applied after greeting check, before scene classification, in both `chat()` and `stream_chat()`.
-
-### Database
-
-SQLModel ORM (`app/business_models.py`) on PostgreSQL with pgvector extension. Key tables:
-- `shops`, `accounts`, `channels`, `keywords` - basic entities
-- `presale_knowledge` / `insale_knowledge` / `aftersale_knowledge` - three scene-specific knowledge tables (each with `SceneKnowledgeMixin` columns: `shop_id`, `goods_id`, `sub_intent`, `aliases`, `answer`, `tags`, `section_title`, `product_family`, `priority`, `enabled`)
-- `scene_knowledge_embeddings` - pgvector HNSW index for vector search
-- `aftersale_chunks` - chunked + vectorized aftersale docs
-- `agent_messages` - chat history (session_id, role, content, timestamp)
-- `orders` - merged orders+delivery+skus (use `extend_existing=True` flag)
-
-`app/db.py::create_session()` returns SQLModel session; `init_db()` registers pgvector extension via `pgvector.psycopg2.register.register_vector` (NOT `pgvector.sqlalchemy.psycopg2`, which doesn't exist).
-
-### Admin API
-
-`app/api/routes_admin.py` exposes 5 endpoints under `/v1/admin/*` (mounted at this prefix in the router). All require `Authorization: Bearer <ADMIN_API_TOKEN>` when `ADMIN_API_TOKEN` env var is set; auth is disabled when unset (dev convenience). Use `hmac.compare_digest` for the check.
-
-Endpoints: `turn-context/dry-run` (POST), `context/validate` (POST), `sessions/{sid}` (GET), `scene-cache/clear` (POST), `context-types` (GET).
+`frontend/` 是 Vite + React 18 + TS + Ant Design 5 SPA。Form-first 流程：`ConsultationForm` 收集店铺/商品/订单号 -> `ChatRoom` SSE 流式聊天。session_id（UUID）+ 消息历史存浏览器 `localStorage`。`npm run build` 产物在 `frontend/dist/`，FastAPI 用 `StaticFiles` 挂载到 `/`（同源，零 CORS）。
 
 ## Workflow Rules
 
-- **Auto-sync docs**: After modifying code, refactoring logic, adding APIs, or changing architecture, evaluate and update `CLAUDE.md` so its project structure, command reference, and conventions stay consistent with the current codebase.
-- After finishing any code change, check whether `CLAUDE.md` needs additional content and proactively update it.
+- **Auto-sync docs**：改代码后评估并更新本文件，保持架构/命令/约定和代码一致。
+- **Prompt injection 防御**：平台传入的值（shop_id / goods_name 等）必须过 `InputBuilder.safe_value()`（`<input>` 标签 + 双花括号转义），不能绕过。
+- pgvector 扩展注册用 `pgvector.psycopg2.register.register_vector`（NOT `pgvector.sqlalchemy.psycopg2`）。
 
-## File map (entry points for common tasks)
+## File map
 
 | Want to... | Edit |
 |------------|------|
-| Add a new contextType | `app/context_models.py` (enum) -> service.py branch |
-| Add a new knowledge column | `app/business_models.py` (SceneKnowledgeMixin) + migration |
+| Add a contextType | `app/context_models.py` -> service.py branch |
 | Change scene routing | `app/orchestrator/scene_classifier.py` |
-| Change system prompt for a scene | `prompt/{scene}.md` |
-| Add a tool for the agent | `app/tools/*.py` with `@agent_tool` decorator |
-| Add an admin endpoint | `app/api/routes_admin.py` (auto-protected by bearer token) |
-| Tune 4-layer fallback | `app/llm/agent_runtime.py` `ask()` / `ask_stream()` (async) |
-| Tune 3-tier API error handling | `app/llm/agent_runtime.py` `_call_llm_ainvoke` / `_call_llm_astream` + `app/llm/retry.py` |
-| Tune message building / history compression | `app/llm/input_builder.py` (async: `build_input_messages` / `_compress_history`) |
-| Tune pre-RAG placeholder filling | `app/llm/input_builder.py` `_fill_db_placeholders` + `app/tools/search_knowledge.py` `fetch_shop_advantages` / `fetch_product_knowledge` |
-| Tune query rewriting | `app/orchestrator/service.py` `_rewrite_question` |
-| Tune request state tracking / logging | `app/orchestrator/request_state.py` (`RequestTracker.transition`) |
-| Tune product card buffer | `app/tools/send_product_card.py` (`_CARDS` / `pop_cards_for_session`) |
-| Add seed data | `script/seed_*.py` (uses `init_db()` + `create_session()`) |
-| Add a golden test case | `tests/golden_*.py` (DATASET list) + `tests/test_*.py` |
+| Change scene prompt | `prompt/{scene}.md` |
+| Add an agent tool | `app/tools/*.py` with `@agent_tool` |
+| Add admin endpoint | `app/api/routes_admin.py` |
+| Add public endpoint | `app/api/routes_shop.py`（rate-limited via `app/api/rate_limit.py`） |
+| Tune fallback / API retry | `app/llm/agent_runtime.py` |
+| Tune message building | `app/llm/input_builder.py` |
+| Tune frontend UI | `frontend/src/components/*.tsx` |
+| Add seed data | `script/seed_*.py` |

@@ -5,10 +5,11 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import get_orchestrator
+from app.api.rate_limit import limiter
 from app.config import get_settings
 from app.llm.agent_runtime import ClientError, _CLIENT_ERROR_MESSAGE
 from app.orchestrator import ChatOrchestrator
@@ -177,8 +178,13 @@ async def chat_get(
 
 @router.post("/chat/stream")
 @router.post("/v1/chat/stream")
-async def chat_stream(request: ChatRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)) -> StreamingResponse:
-    return await _streaming_response_for_question(request.session_id, request.question, request.context, orchestrator)
+@limiter.limit("10/minute")
+async def chat_stream(
+    request: Request,
+    body: ChatRequest,
+    orchestrator: ChatOrchestrator = Depends(get_orchestrator),
+) -> StreamingResponse:
+    return await _streaming_response_for_question(body.session_id, body.question, body.context, orchestrator)
 
 
 @router.get("/chat/stream", response_model=None)

@@ -294,8 +294,11 @@ class ReActQAAgent:
 
     def prewarm(self) -> None:
         logger.info("Pre-warming agent …")
-        from app.retrieval.embedding import get_embeddings
-        get_embeddings()
+        try:
+            from app.retrieval.embedding import get_embeddings
+            get_embeddings()
+        except Exception as exc:
+            logger.warning("Embedding model pre-warm failed (will lazy-load on first use): %s", exc)
         try:
             from app.orchestrator.scene_classifier import _jd_pool_getconn, _jd_pool_putconn
             conn = _jd_pool_getconn()

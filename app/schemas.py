@@ -67,3 +67,19 @@ class ErrorResponse(BaseModel):
     error_code: str
     message: str
     trace_id: str | None = None
+
+
+class ShopInfo(BaseModel):
+    """Public shop info for the chat frontend."""
+    id: int
+    shop_name: str
+    shop_logo: str | None = None
+    description: str | None = None
+
+
+class ProductInfo(BaseModel):
+    """Public product info for the chat frontend product-search results."""
+    goods_id: int
+    goods_name: str
+    price: str | None = None
+    thumb_url: str | None = None
