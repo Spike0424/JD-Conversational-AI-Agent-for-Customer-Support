@@ -122,7 +122,7 @@ export function formStateToContext(state: FormState): ChatContext {
   return {
     type: 'text',
     kwargs: {
-      shop_id: state.shopId,
+      shop_id: String(state.shopId),
       goods_id: state.goodsId,
       goods_name: state.goodsName,
       order_sn: state.orderSn || undefined,
