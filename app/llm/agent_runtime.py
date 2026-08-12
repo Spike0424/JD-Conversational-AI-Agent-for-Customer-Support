@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from app.orchestrator.request_state import RequestState, RequestTracker
 
+import openai
 from langchain_core.messages import ToolMessage, convert_to_messages
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
@@ -22,6 +23,7 @@ from langchain_openai import ChatOpenAI
 from app.config import get_settings
 from app.evaluation.rag_logger import RAGLogger
 from app.llm.input_builder import InputBuilder
+from app.llm.retry import NETWORK_EXC as _NETWORK_EXC, ainvoke_with_network_retry, backoff_delay as _backoff_delay
 from app.session_store import SessionStore
 from app.tools.search_knowledge import SearchKnowledge, get_search_knowledge, set_search_knowledge
 from app.tools.send_product_card import pop_cards_for_session
@@ -30,6 +32,13 @@ from util.agent_tool import get_registered_tools
 logger = logging.getLogger(__name__)
 
 _L1_RETRY_NUDGE = "上一次回答为空。请直接给出简明中文回答，不要只思考。"
+
+_CLIENT_ERROR_MESSAGE = "抱歉，服务器暂时出现了点问题，请稍后再试。"
+
+
+class ClientError(Exception):
+    """4xx LLM error - should not retry, return friendly message to customer."""
+
 
 # Lazy-loaded to avoid circular import (app.orchestrator.__init__ -> service -> agent_runtime)
 _RequestState = None
@@ -61,11 +70,6 @@ def _thinking_extra_body(settings) -> dict[str, Any] | None:
     return None
 
 
-def _backoff_delay(attempt: int) -> float:
-    """Exponential backoff: 0.5s, 1s, 2s, 4s, 8s (capped)."""
-    return min(0.5 * (2 ** attempt), 8.0)
-
-
 class ReActQAAgent:
     """Direct LLM agent with optional single-round tool calling."""
 
@@ -94,6 +98,17 @@ class ReActQAAgent:
                 request_timeout=self._settings.chat_timeout_seconds,
             )
 
+        self._fallback_llm: ChatOpenAI | None = None
+        if self._settings.fallback_api_key and self._settings.fallback_base_url and self._settings.fallback_model_name:
+            self._fallback_llm = ChatOpenAI(
+                api_key=self._settings.fallback_api_key,
+                base_url=self._settings.fallback_base_url,
+                model=self._settings.fallback_model_name,
+                temperature=self._settings.temperature,
+                request_timeout=self._settings.chat_timeout_seconds,
+            )
+            logger.info("Fallback LLM configured: %s", self._settings.fallback_model_name)
+
         self._input_builder = InputBuilder(
             session_store=self._session_store,
             settings=self._settings,
@@ -106,6 +121,98 @@ class ReActQAAgent:
             if self._langchain_tools else self._llm
         )
         self._tools_by_name = {e.name: e for e in get_registered_tools()}
+
+    # ── 3-tier error handling helpers ────────────────────────────────
+
+    async def _call_llm_ainvoke(
+        self, llm: ChatOpenAI, messages: list,
+    ) -> Any:
+        """3-tier error handling for ainvoke: 4xx stop / 5xx retry+fallback / network retry."""
+        supplier_retries = self._settings.supplier_retries
+        for attempt in range(supplier_retries + 1):
+            try:
+                return await ainvoke_with_network_retry(
+                    llm, messages, self._settings.network_retries, "LLM",
+                )
+            except openai.APIStatusError as exc:
+                status = getattr(exc, "status_code", 0) or 0
+                if 400 <= status < 500 and status != 429:
+                    logger.warning("LLM 4xx status=%s - not retrying", status)
+                    raise ClientError(f"LLM client error {status}") from exc
+                if attempt < supplier_retries:
+                    delay = _backoff_delay(attempt)
+                    logger.warning(
+                        "LLM 5xx status=%s attempt=%s/%s delay=%.1fs",
+                        status, attempt + 1, supplier_retries, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                if self._fallback_llm and llm is not self._fallback_llm:
+                    logger.warning("Switching to fallback model after 5xx exhaustion")
+                    return await ainvoke_with_network_retry(
+                        self._fallback_llm, messages, self._settings.network_retries, "LLM fallback",
+                    )
+                raise
+        raise RuntimeError("_call_llm_ainvoke exhausted without returning")
+
+    async def _call_llm_astream(
+        self, llm: ChatOpenAI, messages: list,
+    ) -> tuple[Any, Any]:
+        """3-tier error handling for astream_events. Retries only before first event.
+
+        Returns (gen, first_event) on success. Caller must continue iterating gen.
+        Raises ClientError on 4xx, or the last exception on retry exhaustion.
+        """
+        supplier_retries = self._settings.supplier_retries
+        network_retries = self._settings.network_retries
+        current_llm = llm
+        network_attempt = 0
+        supplier_attempt = 0
+        while True:
+            try:
+                gen = current_llm.astream_events(messages, version="v2")
+                first_event = await gen.__anext__()
+                return gen, first_event
+            except openai.APIStatusError as exc:
+                status = getattr(exc, "status_code", 0) or 0
+                if 400 <= status < 500 and status != 429:
+                    logger.warning("LLM stream 4xx status=%s - not retrying", status)
+                    raise ClientError(f"LLM client error {status}") from exc
+                if supplier_attempt < supplier_retries:
+                    delay = _backoff_delay(supplier_attempt)
+                    logger.warning(
+                        "LLM stream 5xx status=%s attempt=%s/%s delay=%.1fs",
+                        status, supplier_attempt + 1, supplier_retries, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    supplier_attempt += 1
+                    network_attempt = 0
+                    continue
+                if self._fallback_llm and current_llm is not self._fallback_llm:
+                    logger.warning("Switching to fallback model after 5xx exhaustion (stream)")
+                    current_llm = self._fallback_llm
+                    supplier_attempt = 0
+                    network_attempt = 0
+                    continue
+                raise
+            except _NETWORK_EXC as exc:
+                if network_attempt < network_retries:
+                    delay = _backoff_delay(network_attempt)
+                    logger.warning(
+                        "Network error (stream) attempt=%s/%s delay=%.1fs %s: %s",
+                        network_attempt + 1, network_retries, delay, type(exc).__name__, exc,
+                    )
+                    await asyncio.sleep(delay)
+                    network_attempt += 1
+                    continue
+                # Network exhausted on primary -> try fallback once (consistent with 5xx path)
+                if self._fallback_llm and current_llm is not self._fallback_llm:
+                    logger.warning("Switching to fallback model after network exhaustion (stream)")
+                    current_llm = self._fallback_llm
+                    supplier_attempt = 0
+                    network_attempt = 0
+                    continue
+                raise
 
     # ── Tool wiring ───────────────────────────────────────────────────
 
@@ -226,7 +333,7 @@ class ReActQAAgent:
         """
         lc_messages = convert_to_messages(messages)
         llm = self._llm_with_tools if allow_tools else self._llm
-        response = await llm.ainvoke(lc_messages)
+        response = await self._call_llm_ainvoke(llm, lc_messages)
 
         if not allow_tools:
             self._log_llm_messages(lc_messages, "ainvoke_no_tools")
@@ -243,7 +350,7 @@ class ReActQAAgent:
             lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
 
         self._log_llm_messages(lc_messages, "ainvoke_final")
-        final = await self._llm.ainvoke(lc_messages)
+        final = await self._call_llm_ainvoke(self._llm, lc_messages)
         return self._extract_text(getattr(final, "content", ""))
 
     async def _stream_with_tools(
@@ -261,7 +368,7 @@ class ReActQAAgent:
            - 有 -> 执行 tool，追加 ToolMessage，再 astream_events 流式输出最终回答
            - 无 -> 已经 yield 完了，直接返回
 
-        用 astream_events 而不是 ainvoke，确保无 tool 时也能逐字输出。
+        3-tier 错误处理只在第一个 event 之前生效；mid-stream 错误只 log + yield 提示。
         """
         lc_messages = convert_to_messages(messages)
 
@@ -269,19 +376,25 @@ class ReActQAAgent:
         collected_tool_calls: list = []
         final_response: Any = None
 
-        async for event in self._llm_with_tools.astream_events(lc_messages, version="v2"):
-            kind = event.get("event", "")
-            if kind == "on_chat_model_stream":
-                chunk = event.get("data", {}).get("chunk")
-                if chunk is None:
-                    continue
-                text = self._extract_text(getattr(chunk, "content", ""))
-                if text:
-                    yield text
-            elif kind == "on_chat_model_end":
-                final_response = event.get("data", {}).get("output")
-                if final_response:
-                    collected_tool_calls = getattr(final_response, "tool_calls", None) or []
+        gen, first_event = await self._call_llm_astream(self._llm_with_tools, lc_messages)
+        try:
+            for event in [first_event] + [e async for e in gen]:
+                kind = event.get("event", "")
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk is None:
+                        continue
+                    text = self._extract_text(getattr(chunk, "content", ""))
+                    if text:
+                        yield text
+                elif kind == "on_chat_model_end":
+                    final_response = event.get("data", {}).get("output")
+                    if final_response:
+                        collected_tool_calls = getattr(final_response, "tool_calls", None) or []
+        except Exception as exc:
+            logger.exception("Mid-stream error (cannot retry): %s", exc)
+            yield _CLIENT_ERROR_MESSAGE
+            return
 
         if not collected_tool_calls:
             return
@@ -294,15 +407,20 @@ class ReActQAAgent:
             lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
 
         self._log_llm_messages(lc_messages, "astream_final")
-        async for event in self._llm.astream_events(lc_messages, version="v2"):
-            kind = event.get("event", "")
-            if kind == "on_chat_model_stream":
-                chunk = event.get("data", {}).get("chunk")
-                if chunk is None:
-                    continue
-                text = self._extract_text(getattr(chunk, "content", ""))
-                if text:
-                    yield text
+        gen2, first_event2 = await self._call_llm_astream(self._llm, lc_messages)
+        try:
+            for event in [first_event2] + [e async for e in gen2]:
+                kind = event.get("event", "")
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk is None:
+                        continue
+                    text = self._extract_text(getattr(chunk, "content", ""))
+                    if text:
+                        yield text
+        except Exception as exc:
+            logger.exception("Mid-stream error in phase 2 (cannot retry): %s", exc)
+            yield _CLIENT_ERROR_MESSAGE
 
     def _resolve_fallback_answer(
         self,
@@ -392,6 +510,10 @@ class ReActQAAgent:
                     session_id, elapsed_ms, answer,
                 )
                 return answer
+            except ClientError as exc:
+                logger.warning("ClientError, returning friendly message: %s", exc)
+                self._input_builder.persist_user(session_id, question)
+                return _CLIENT_ERROR_MESSAGE
             except Exception as exc:
                 last_err = exc
                 if attempt < max_retries:
@@ -471,6 +593,11 @@ class ReActQAAgent:
                     "【LLM 输出】session=%s elapsed=%dms answer=%s",
                     session_id, elapsed_ms, answer,
                 )
+                return
+            except ClientError as exc:
+                logger.warning("ClientError (stream), yielding friendly message: %s", exc)
+                self._input_builder.persist_user(session_id, question)
+                yield _CLIENT_ERROR_MESSAGE
                 return
             except Exception as exc:
                 last_err = exc

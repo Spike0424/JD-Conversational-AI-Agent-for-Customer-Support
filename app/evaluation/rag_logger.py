@@ -37,15 +37,14 @@ class RAGLogger:
             if key in fields:
                 record[key] = fields[key]
 
-        # Truncate text fields for log readability
         if "retrieved_chunks" in fields:
             record["retrieved_chunks"] = [
                 {
                     "source": c.get("source", ""),
                     "score": round(c.get("score", 0), 4),
-                    "snippet": c.get("snippet", ""),
+                    "snippet": _safe_preview(c.get("snippet", ""), 200),
                 }
-                for c in fields["retrieved_chunks"][:10]
+                for c in fields["retrieved_chunks"][:50]
             ]
 
         if "rerank_result" in fields:
@@ -59,7 +58,7 @@ class RAGLogger:
                     "keyword_score": r.get("keyword_score", 0),
                     "vector_similarity": r.get("vector_similarity", 0),
                 }
-                for i, r in enumerate(fields["rerank_result"][:10])
+                for i, r in enumerate(fields["rerank_result"][:50])
             ]
 
         if "llm_answer" in fields:

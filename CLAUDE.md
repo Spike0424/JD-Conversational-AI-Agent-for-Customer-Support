@@ -88,6 +88,28 @@ In `ReActQAAgent.ask()` / `ask_stream()` (both `async def`, accept `tracker: Req
 
 In `app/evaluation/generation_metrics.py::_judge()`: wraps `judge_llm.ainvoke()` (async) in try/except; one transient API failure does not abort the batch.
 
+### API error handling (3-tier)
+
+LLM calls (`_call_llm_ainvoke` / `_call_llm_astream` in `app/llm/agent_runtime.py`) classify exceptions into 3 tiers. Shared retry utilities (`NETWORK_EXC`, `backoff_delay`) live in `app/llm/retry.py`.
+
+1. **4xx (except 429)** - raise `ClientError`, no retry, no fallback. `ask()` / `ask_stream()` catch it and return `_CLIENT_ERROR_MESSAGE` ("抱歉，服务器暂时出现了点问题，请稍后再试。"). `routes_chat.py` also catches `ClientError` in `_with_retry_async` (returns 502) and `event_stream()` (yields SSE error event).
+2. **5xx / 429 (supplier)** - retry `SUPPLIER_RETRIES` (default 2) times with backoff+jitter on the same model; on exhaustion switch to the fallback model (different provider, configured via `FALLBACK_API_KEY` / `FALLBACK_BASE_URL` / `FALLBACK_MODEL_NAME`). Fallback gets tier-3 network retry but not tier-2 5xx retry.
+3. **Network errors** (`openai.APITimeoutError` / `APIConnectionError` / `httpx.TimeoutException` / `ConnectError`) - retry `NETWORK_RETRIES` (default 3) times with exponential backoff + jitter (`backoff_delay` in `app/llm/retry.py`).
+
+Streaming only retries before the first event; mid-stream errors are logged and yield `_CLIENT_ERROR_MESSAGE` to the client (cannot retry once chunks have been sent).
+
+### Pre-RAG prompt placeholder filling
+
+`InputBuilder._fill_db_placeholders()` (`app/llm/input_builder.py`) replaces `[DB_SHOP_ADVANTAGES]` and `[DB_PRODUCT_KNOWLEDGE]` placeholders in scene prompts with actual KB data before sending to the LLM. This prevents the LLM from calling `search_knowledge` just to fill empty placeholders.
+
+- `[DB_SHOP_ADVANTAGES]` <- `SearchKnowledge.fetch_shop_advantages(shop_id, scene)` (entries with `goods_id IS NULL`)
+- `[DB_PRODUCT_KNOWLEDGE]` <- `SearchKnowledge.fetch_product_knowledge(shop_id, scene, goods_id)` (entries with `goods_id == current`)
+- `[DB_SHIPPING_POLICY]` and `[DB_HOT_MODELS_RECOMMENDATION]` are blanked to `""` (their content is covered by `[DB_SHOP_ADVANTAGES]` or needs separate query; update `prompt/presales.md` if you want the LLM to stop referencing them).
+
+### Query rewriting
+
+`ChatOrchestrator._rewrite_question()` (`app/orchestrator/service.py`) replaces vague references like "这手机" / "这款手机" / "该手机" with the actual `goods_name` from `deps`, so the LLM gets a clearer question and doesn't split intent. Applied after greeting check, before scene classification, in both `chat()` and `stream_chat()`.
+
 ### Database
 
 SQLModel ORM (`app/business_models.py`) on PostgreSQL with pgvector extension. Key tables:
@@ -122,7 +144,10 @@ Endpoints: `turn-context/dry-run` (POST), `context/validate` (POST), `sessions/{
 | Add a tool for the agent | `app/tools/*.py` with `@agent_tool` decorator |
 | Add an admin endpoint | `app/api/routes_admin.py` (auto-protected by bearer token) |
 | Tune 4-layer fallback | `app/llm/agent_runtime.py` `ask()` / `ask_stream()` (async) |
+| Tune 3-tier API error handling | `app/llm/agent_runtime.py` `_call_llm_ainvoke` / `_call_llm_astream` + `app/llm/retry.py` |
 | Tune message building / history compression | `app/llm/input_builder.py` (async: `build_input_messages` / `_compress_history`) |
+| Tune pre-RAG placeholder filling | `app/llm/input_builder.py` `_fill_db_placeholders` + `app/tools/search_knowledge.py` `fetch_shop_advantages` / `fetch_product_knowledge` |
+| Tune query rewriting | `app/orchestrator/service.py` `_rewrite_question` |
 | Tune request state tracking / logging | `app/orchestrator/request_state.py` (`RequestTracker.transition`) |
 | Tune product card buffer | `app/tools/send_product_card.py` (`_CARDS` / `pop_cards_for_session`) |
 | Add seed data | `script/seed_*.py` (uses `init_db()` + `create_session()`) |

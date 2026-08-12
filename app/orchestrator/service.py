@@ -72,6 +72,16 @@ class ChatOrchestrator:
             sk.set_context(shop_id=shop_id, scene=scene, goods_id=goods_id, goods_name=deps.get("goods_name", ""))
             sk.set_history(self._agent.recent_user_messages(session_id))
 
+    @staticmethod
+    def _rewrite_question(question: str, deps: dict[str, Any]) -> str:
+        """Replace vague references like '这手机' with the actual goods_name from context."""
+        goods_name = deps.get("goods_name")
+        if not goods_name:
+            return question
+        for pattern in ("这款手机", "这部手机", "这手机", "该手机", "这个手机", "这台手机"):
+            question = question.replace(pattern, goods_name)
+        return question
+
     async def chat(
         self,
         session_id: str,
@@ -166,6 +176,7 @@ class ChatOrchestrator:
         # ── 6. 正常流：scene classifier + agent ──
         # 当 context.content 已经被 TurnContext 归一化过，优先用提取出来的 customer_text
         # （商品卡 / 订单卡 / 元数据已经被剥离）作为 question，避免把空 question 喂给 LLM。
+        effective_question = self._rewrite_question(effective_question, deps)
         raw_scene = await self._scene_classifier.classify(deps, effective_question, session_id)
         scene = normalize_customer_scene(raw_scene) or raw_scene
         tracker.transition(RequestState.SCENE_CLASSIFIED, scene=scene)
@@ -244,7 +255,8 @@ class ChatOrchestrator:
                 "GREETING",
             )
 
-        raw_scene = await self._scene_classifier.classify(deps, question, session_id)
+        effective_question = self._rewrite_question(effective_question, deps)
+        raw_scene = await self._scene_classifier.classify(deps, effective_question, session_id)
         scene = normalize_customer_scene(raw_scene) or raw_scene
         tracker.transition(RequestState.SCENE_CLASSIFIED, scene=scene)
 
@@ -259,7 +271,7 @@ class ChatOrchestrator:
             [],
             [],
             self._agent.ask_stream(
-                session_id=session_id, question=question, scene=scene, dependencies=deps, tracker=tracker,
+                session_id=session_id, question=effective_question, scene=scene, dependencies=deps, tracker=tracker,
             ),
             "LLM",
         )

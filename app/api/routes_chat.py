@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -9,6 +10,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.api.deps import get_orchestrator
 from app.config import get_settings
+from app.llm.agent_runtime import ClientError, _CLIENT_ERROR_MESSAGE
 from app.orchestrator import ChatOrchestrator
 from app.schemas import (
     ChatRequest,
@@ -17,6 +19,8 @@ from app.schemas import (
     HandoffRequest,
     HandoffResponse,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 
@@ -40,7 +44,7 @@ def _error_response(status_code: int, error_code: str, message: str, trace_id: s
 
 
 async def _with_retry_async(coro_factory: Callable[[], Any], error_code: str) -> Any:
-    """Execute async operation with linear-backoff retry."""
+    """Execute async operation with linear-backoff retry. ClientError (4xx) is not retried."""
     settings = get_settings()
     max_retries = max(0, settings.chat_retries)
     last_error: Exception | None = None
@@ -49,6 +53,9 @@ async def _with_retry_async(coro_factory: Callable[[], Any], error_code: str) ->
             return await coro_factory()
         except ValueError:
             raise
+        except ClientError as exc:
+            logger.warning("ClientError in %s, not retrying: %s", error_code, exc)
+            return _error_response(502, f"{error_code}_CLIENT_ERROR", _CLIENT_ERROR_MESSAGE)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt >= max_retries:
@@ -112,6 +119,13 @@ async def _streaming_response_for_question(
             async for chunk in chunks:
                 yield f"data: {json.dumps({'delta': chunk}, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
+        except ClientError as exc:
+            logger.warning("Stream ClientError: %s", exc)
+            error = json.dumps(
+                {"error_code": "CLIENT_ERROR", "message": _CLIENT_ERROR_MESSAGE, "trace_id": trace_id},
+                ensure_ascii=False,
+            )
+            yield f"data: {error}\n\n"
         except Exception as exc:  # noqa: BLE001
             error = json.dumps(
                 {"error_code": "STREAM_RUNTIME_ERROR", "message": str(exc), "trace_id": trace_id},

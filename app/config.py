@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     chat_timeout_seconds: int = Field(default=60, alias="CHAT_TIMEOUT_SECONDS")
     chat_retries: int = Field(default=1, alias="CHAT_RETRIES")
     agent_recursion_limit: int = Field(default=6, alias="AGENT_RECURSION_LIMIT")
+    # ── API 调用 3 层兜底配置 ─────────────────────────────────────────
+    # Fallback 模型（不同 provider，5xx 重试耗尽后切换）
+    fallback_api_key: str = Field(default="", alias="FALLBACK_API_KEY")
+    fallback_base_url: str = Field(default="", alias="FALLBACK_BASE_URL")
+    fallback_model_name: str = Field(default="", alias="FALLBACK_MODEL_NAME")
+    # tier 2: 供应商 5xx/429 重试次数（不含首次）
+    supplier_retries: int = Field(default=2, alias="SUPPLIER_RETRIES")
+    # tier 3: 网络错误（timeout / 连接重置）重试次数（不含首次）
+    network_retries: int = Field(default=3, alias="NETWORK_RETRIES")
     # ── 混合检索搜索词配置 ────────────────────────────────────────────
     search_phrase_candidates: list[str] = Field(
         default_factory=lambda: [
