@@ -1,5 +1,5 @@
 import { Typography } from 'antd'
-import type { ChatMessage } from '../types'
+import type { ChatMessage } from '../service/types'
 import { ProductCardView } from './ProductCardView'
 
 export function MessageBubble({ msg }: { msg: ChatMessage }) {

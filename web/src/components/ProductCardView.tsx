@@ -1,5 +1,5 @@
 import { Card, Image, Typography } from 'antd'
-import type { ProductCard } from '../types'
+import type { ProductCard } from '../service/types'
 
 const { Text } = Typography
 

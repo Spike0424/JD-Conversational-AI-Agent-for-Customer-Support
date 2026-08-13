@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Button, Card, Form, Input, message as antdMessage, Select, Typography } from 'antd'
-import { fetchProducts, fetchShops } from '../api'
-import type { ChatContext, ProductInfo, ShopInfo } from '../types'
+import { fetchProducts, fetchShops } from '../service/api'
+import type { ChatContext, ProductInfo, ShopInfo } from '../service/types'
 
 const { Title, Text } = Typography
 

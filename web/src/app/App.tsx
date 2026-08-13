@@ -1,9 +1,9 @@
 import { useState } from 'react'
 import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
-import { ChatRoom } from './components/ChatRoom'
-import { ConsultationForm, formStateToContext, type FormState } from './components/ConsultationForm'
-import { useSession } from './hooks/useSession'
+import { ChatRoom } from '../components/ChatRoom'
+import { ConsultationForm, formStateToContext, type FormState } from '../components/ConsultationForm'
+import { useSession } from '../hooks/useSession'
 
 function App() {
   const { sessionId, newSession } = useSession()

@@ -1,8 +1,8 @@
 import { useRef, useState } from 'react'
 import { Button, Input, Space, Spin, Typography, message as antdMessage } from 'antd'
-import { streamChat } from '../api'
+import { streamChat } from '../service/api'
 import { useChatHistory } from '../hooks/useChatHistory'
-import type { ChatContext } from '../types'
+import type { ChatContext } from '../service/types'
 import { MessageBubble } from './MessageBubble'
 
 const { Text } = Typography

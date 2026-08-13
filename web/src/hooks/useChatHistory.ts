@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ChatMessage } from '../types'
+import type { ChatMessage } from '../service/types'
 
 const MESSAGES_KEY = 'chat_messages'
 const PERSIST_DEBOUNCE_MS = 500

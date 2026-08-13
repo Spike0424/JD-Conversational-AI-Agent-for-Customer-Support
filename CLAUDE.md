@@ -9,34 +9,35 @@ Guidance for Claude Code working in this repository.
 ## Commands
 
 ```bash
-uv sync                                       # install backend deps
-uv run uvicorn main:app --reload              # FastAPI :8000
-uv run .venv/bin/pytest -q                    # tests
+uv sync                                            # install backend deps
+uv run uvicorn api.main:app --reload               # FastAPI :8000
+uv run .venv/bin/pytest -q                         # tests
 PGPASSWORD=pg2024 psql -h 127.0.0.1 -p 5434 -U postgres -d jd_agent -c "..."  # DB
-cd frontend && npm install && npm run dev     # Vite :5173 (proxy /v1 -> :8000)
-cd frontend && npm run build                  # build to frontend/dist/ (FastAPI serves it)
+cd web && npm install && npm run dev               # Vite :5173 (proxy /v1 -> :8000)
+cd web && npm run build                            # build to web/dist/ (FastAPI serves it)
+cd web && npx tsc --noEmit                        # TS type check
 ```
 
 ## Architecture
 
 ```
 HTTP (FastAPI)
-  -> routes_chat.py / routes_admin.py / routes_shop.py
-  -> ChatOrchestrator (app/orchestrator/service.py)
+  -> api/controllers/{chat,admin,shop}.py    # routes
+  -> ChatOrchestrator (api/core/orchestrator.py)
     ├─ turn_context.py        # parse raw turn -> ProductCard / OrderCard / MediaInfo
     ├─ scene_classifier.py    # presale / insale / aftersale / mixed via orders table
     ├─ request_state.py       # RequestTracker state machine (per-request logging)
     ├─ agent_runtime.py       # LLM + bind_tools single-round (no ReAct loop)
     │    ├─ input_builder.py  # scene prompt + history compression + session-info
-    │    └─ tools/search_knowledge.py   # hybrid retrieval (alias + keyword + vector)
+    │    └─ knowledge.py      # hybrid retrieval (alias + keyword + vector)
     └─ session_store.py       # agent_messages table
 ```
 
-`ChatOrchestrator.chat` branches on `Context.type` before LLM：silent（withdraw/system）-> 空答；image/video -> transfer_to_human；goods_card 无文字 -> 欢迎语；greeting -> 欢迎语跳过 LLM；否则走 scene classifier + agent。`main.py` lifespan 里 `prewarm()` 预热 embedding 模型和 DB pool。
+`ChatOrchestrator.chat` branches on `Context.type` before LLM：silent（withdraw/system）-> 空答；image/video -> transfer_to_human；goods_card 无文字 -> 欢迎语；greeting -> 欢迎语跳过 LLM；否则走 scene classifier + agent。`api/main.py` lifespan 里 `prewarm()` 预热 embedding 模型和 DB pool。
 
-**4 层空答兜底**（`agent_runtime.py::ask` / `ask_stream`）：L1 重试 + nudge -> L2 KB 检索 -> L3 默认回复 -> L4 空答不入历史。**3 层 API 错误兜底**（`_call_llm_ainvoke`）：4xx 直接 ClientError / 5xx 重试 2 次换 fallback 模型 / 网络错误指数退避重试 3 次。共享工具在 `app/llm/retry.py`。
+**4 层空答兜底**（`api/core/agent_runtime.py::ask` / `ask_stream`）：L1 重试 + nudge -> L2 KB 检索 -> L3 默认回复 -> L4 空答不入历史。**3 层 API 错误兜底**（`api/core/agent_runtime.py::_call_llm_ainvoke`）：4xx 直接 ClientError / 5xx 重试 2 次换 fallback 模型 / 网络错误指数退避重试 3 次。共享工具在 `api/core/retry.py`。
 
-**Pre-RAG 占位符填充**（`input_builder.py::_fill_db_placeholders`）：发 LLM 前把 prompt 里的 `[DB_SHOP_ADVANTAGES]` / `[DB_PRODUCT_KNOWLEDGE]` 占位符替换成 KB 数据，避免 LLM 为填占位符多余调 `search_knowledge`。`SearchKnowledge.fetch_shop_advantages` / `fetch_product_knowledge` 60s TTL 缓存。
+**Pre-RAG 占位符填充**（`api/core/input_builder.py::_fill_db_placeholders`）：发 LLM 前把 prompt 里的 `[DB_SHOP_ADVANTAGES]` / `[DB_PRODUCT_KNOWLEDGE]` 占位符替换成 KB 数据，避免 LLM 为填占位符多余调 `search_knowledge`。`SearchKnowledge.fetch_shop_advantages` / `fetch_product_knowledge` 60s TTL 缓存。
 
 ## Endpoints
 
@@ -44,11 +45,18 @@ HTTP (FastAPI)
 |------|------|------|
 | Chat | `POST /v1/chat` / `/v1/chat/stream` | 流式用 SSE（`fetch` + `ReadableStream`） |
 | Public | `GET /v1/shops` / `/v1/products` | 前端表单用，slowapi IP 限流（30/min, 10/min） |
-| Admin | `/v1/admin/*` | `routes_admin.py`，bearer token 鉴权 |
+| Admin | `/v1/admin/*` | `api/controllers/admin.py`，bearer token 鉴权 |
 
 ## Frontend
 
-`frontend/` 是 Vite + React 18 + TS + Ant Design 5 SPA。Form-first 流程：`ConsultationForm` 收集店铺/商品/订单号 -> `ChatRoom` SSE 流式聊天。session_id（UUID）+ 消息历史存浏览器 `localStorage`。`npm run build` 产物在 `frontend/dist/`，FastAPI 用 `StaticFiles` 挂载到 `/`（同源，零 CORS）。
+`web/` 是 Vite + React 18 + TS + Ant Design 5 SPA，src 按层分：
+- `web/src/app/` — App.tsx + main.tsx（入口）
+- `web/src/service/` — api.ts + types.ts（API 客户端 + 类型）
+- `web/src/hooks/` — useSession, useChatHistory
+- `web/src/components/` — ChatRoom, ConsultationForm, MessageBubble, ProductCardView
+- `web/src/context/` — 空（预留）
+
+Form-first 流程：`ConsultationForm` 收集店铺/商品/订单号 -> `ChatRoom` SSE 流式聊天。session_id（UUID）+ 消息历史存浏览器 `localStorage`。`npm run build` 产物在 `web/dist/`，FastAPI 用 `StaticFiles` 挂载到 `/`（同源，零 CORS）。
 
 ## Workflow Rules
 
@@ -60,13 +68,14 @@ HTTP (FastAPI)
 
 | Want to... | Edit |
 |------------|------|
-| Add a contextType | `app/context_models.py` -> service.py branch |
-| Change scene routing | `app/orchestrator/scene_classifier.py` |
+| Add a contextType | `api/models/context.py` -> `api/core/orchestrator.py` branch |
+| Change scene routing | `api/core/scene_classifier.py` |
 | Change scene prompt | `prompt/{scene}.md` |
-| Add an agent tool | `app/tools/*.py` with `@agent_tool` |
-| Add admin endpoint | `app/api/routes_admin.py` |
-| Add public endpoint | `app/api/routes_shop.py`（rate-limited via `app/api/rate_limit.py`） |
-| Tune fallback / API retry | `app/llm/agent_runtime.py` |
-| Tune message building | `app/llm/input_builder.py` |
-| Tune frontend UI | `frontend/src/components/*.tsx` |
-| Add seed data | `script/seed_*.py` |
+| Add an agent tool | `api/services/knowledge.py` (search) or `api/services/product_card.py` (UI) |
+| Add admin endpoint | `api/controllers/admin.py`（bearer token 鉴权） |
+| Add public endpoint | `api/controllers/shop.py`（rate-limited via `api/controllers/rate_limit.py`） |
+| Tune 4-layer fallback | `api/core/agent_runtime.py::ask` / `ask_stream()` |
+| Tune 3-tier API retry | `api/core/agent_runtime.py::_call_llm_ainvoke` + `api/core/retry.py` |
+| Tune message building / pre-RAG | `api/core/input_builder.py::_fill_db_placeholders` + `api/services/knowledge.py` `fetch_shop_advantages` |
+| Tune frontend UI | `web/src/components/*.tsx`（ChatRoom / ConsultationForm / MessageBubble） |
+| Add seed data | `scripts/seed_*.py` |
