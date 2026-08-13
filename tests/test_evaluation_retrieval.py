@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from app.evaluation.retrieval_metrics import (
+from api.services.retrieval_metrics import (
     _is_relevant,
     aggregate_retrieval,
     compute_retrieval_metrics,
     normalize_docs,
 )
-from app.evaluation.schemas import RetrievalEvalResult
+from api.models.eval_schemas import RetrievalEvalResult
 
 
 def make_doc(source: str, score: float = 0.1, snippet: str = "") -> dict:

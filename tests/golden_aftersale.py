@@ -5,11 +5,11 @@
 
 调用：
     from tests.golden_aftersale import DATASET
-    from app.evaluation.runner import EvalRunner
+    from api.services.eval_runner import EvalRunner
     report = EvalRunner().run(DATASET, dataset_name="golden_aftersale")
 """
 
-from app.evaluation.schemas import EvalQuery
+from api.models.eval_schemas import EvalQuery
 
 # user_002 在 seed_orders.py 中有 15 条已签收订单
 # scene_classifier 通过 arr_time NOT NULL → all_signed=True → aftersale

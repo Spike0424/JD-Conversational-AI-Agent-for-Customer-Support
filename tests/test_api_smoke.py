@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 
 def test_health() -> None:
-    from main import app
+    from api.main import app
 
     r = TestClient(app).get("/health")
     assert r.status_code == 200

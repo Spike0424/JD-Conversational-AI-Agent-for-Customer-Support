@@ -1,6 +1,6 @@
 """Tests for prompt-injection protection in _format_session_info."""
 
-from app.llm.input_builder import InputBuilder
+from api.core.input_builder import InputBuilder
 
 
 def _format(deps: dict | None) -> str:

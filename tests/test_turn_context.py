@@ -1,6 +1,6 @@
 """Tests for the TurnContext parser (regex-based extraction from raw_query)."""
 
-from app.orchestrator.turn_context import (
+from api.core.turn_context import (
     parse_turn_context,
     turn_context_to_dict,
 )

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.schemas import ChatResponse
+from api.models.schemas import ChatResponse
 
 
 def run_async(coro):
@@ -18,7 +18,7 @@ def _default_test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     monkeypatch.setenv("RAG_ENABLED", "false")
-    from app.config import get_settings
+    from api.core.config import get_settings
 
     get_settings.cache_clear()
     yield
@@ -38,8 +38,8 @@ def orch_stub() -> MagicMock:
 def api_client(orch_stub: MagicMock):
     from fastapi.testclient import TestClient
 
-    from app.api.deps import get_orchestrator
-    from main import app
+    from api.controllers.deps import get_orchestrator
+    from api.main import app
 
     app.dependency_overrides[get_orchestrator] = lambda: orch_stub
     yield TestClient(app)

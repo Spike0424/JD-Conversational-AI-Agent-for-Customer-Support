@@ -3,9 +3,9 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.routes_admin import router as admin_router
-from app.orchestrator import scene_classifier
-from app.orchestrator.scene_classifier import SceneClassifier
+from api.controllers.admin import router as admin_router
+from api.core import scene_classifier
+from api.core.scene_classifier import SceneClassifier
 from fastapi import FastAPI
 
 

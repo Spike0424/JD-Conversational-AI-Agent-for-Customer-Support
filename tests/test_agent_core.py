@@ -4,10 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.config import get_settings
-from app.llm.agent_runtime import ReActQAAgent
-from app.llm.input_builder import InputBuilder
-from app.session_store import SessionStore
+from api.core.config import get_settings
+from api.core.agent_runtime import ReActQAAgent
+from api.core.input_builder import InputBuilder
+from api.models.session_store import SessionStore
 from tests.conftest import run_async
 
 

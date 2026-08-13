@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.evaluation.generation_metrics import (
+from api.services.gen_metrics import (
     _clamp_score,
     _parse_judge_response,
     aggregate_generation,
@@ -15,8 +15,8 @@ from app.evaluation.generation_metrics import (
     evaluate_faithfulness,
     evaluate_noise_sensitivity,
 )
-from app.evaluation.retrieval_metrics import normalize_docs
-from app.evaluation.schemas import GenerationEvalResult, RetrievedDoc
+from api.services.retrieval_metrics import normalize_docs
+from api.models.eval_schemas import GenerationEvalResult, RetrievedDoc
 
 
 def _make_retrieved_docs(sources: list[str]) -> list[RetrievedDoc]:
@@ -88,7 +88,7 @@ class TestBuildJudgeLLM:
     def test_returns_none_when_api_key_missing(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "")
         monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        from app.config import get_settings
+        from api.core.config import get_settings
         get_settings.cache_clear()
         try:
             llm = build_judge_llm()
@@ -99,7 +99,7 @@ class TestBuildJudgeLLM:
     def test_returns_none_when_base_url_missing(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.setenv("OPENAI_BASE_URL", "")
-        from app.config import get_settings
+        from api.core.config import get_settings
         get_settings.cache_clear()
         try:
             llm = build_judge_llm()
@@ -110,10 +110,10 @@ class TestBuildJudgeLLM:
     def test_returns_llm_when_configured(self, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        from app.config import get_settings
+        from api.core.config import get_settings
         get_settings.cache_clear()
         try:
-            with patch("app.evaluation.generation_metrics.ChatOpenAI") as mock_llm:
+            with patch("api.services.gen_metrics.ChatOpenAI") as mock_llm:
                 build_judge_llm()
                 mock_llm.assert_called_once()
         finally:

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 @pytest.fixture
 def shop_client(monkeypatch: pytest.MonkeyPatch):
     """Client with mocked DB session returning canned shops/products."""
-    from main import app
+    from api.main import app
 
     mock_session = MagicMock()
     mock_shop = MagicMock(id=1, shop_name="测试店铺", shop_logo=None, description="测试描述")
@@ -19,7 +19,7 @@ def shop_client(monkeypatch: pytest.MonkeyPatch):
     # search_products uses session.query(ProductKnowledge).filter().filter().limit().all()
     mock_session.query.return_value.filter.return_value.filter.return_value.limit.return_value.all.return_value = [mock_product]
 
-    monkeypatch.setattr("app.api.routes_shop.create_session", lambda: mock_session)
+    monkeypatch.setattr("api.controllers.shop.create_session", lambda: mock_session)
     return TestClient(app)
 
 

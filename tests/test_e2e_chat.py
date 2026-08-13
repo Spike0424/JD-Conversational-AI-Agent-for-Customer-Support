@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.context_models import ChannelKwargs, Context, ContextType
-from app.orchestrator.service import ChatOrchestrator
+from api.models.context import ChannelKwargs, Context, ContextType
+from api.core.orchestrator import ChatOrchestrator
 from tests.conftest import run_async
 
 _DEFAULT_SHOP = "7"

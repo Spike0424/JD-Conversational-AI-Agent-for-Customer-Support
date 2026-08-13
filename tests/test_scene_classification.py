@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 
-from app.orchestrator.scene_classifier import SceneClassifier
+from api.core.scene_classifier import SceneClassifier
 from tests.golden_aftersale import DATASET
 
 
@@ -95,7 +95,7 @@ def test_mixed_user_classifies_insale() -> None:
 def test_mixed_scene_prompt_file_exists() -> None:
     """The mixed.md prompt must exist for clarification flow."""
     from pathlib import Path
-    from app.config import get_settings
+    from api.core.config import get_settings
     settings = get_settings()
     p = Path(settings.prompt_dir) / "mixed.md"
     assert p.exists(), f"Missing prompt: {p}"

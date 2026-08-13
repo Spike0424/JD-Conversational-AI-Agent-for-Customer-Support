@@ -1,12 +1,12 @@
 """Tests for the platform context models (ContextType / ChannelType / Context)."""
 
-from app.context_models import (
+from api.models.context import (
     ChannelKwargs,
     ChannelType,
     Context,
     ContextType,
 )
-from app.schemas import ChatRequest, ChatResponse
+from api.models.schemas import ChatRequest, ChatResponse
 
 
 # ── ContextType flags ─────────────────────────────────────────────────
