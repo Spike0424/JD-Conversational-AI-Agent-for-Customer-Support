@@ -61,7 +61,7 @@ Form-first 流程：`ConsultationForm` 收集店铺/商品/订单号 -> `ChatRoo
 ## Workflow Rules
 
 - **Auto-sync docs**：改代码后评估并更新本文件，保持架构/命令/约定和代码一致。
-- **Prompt injection 防御**：平台传入的值（shop_id / goods_name 等）必须过 `InputBuilder.safe_value()`（`<input>` 标签 + 双花括号转义），不能绕过。
+- **Prompt injection 防御**：**代码级**（不是 prompt 文字）。`InputBuilder.safe_value()` 包平台值（`<input>` 标签 + 双花括号），`InputBuilder.sanitize_user_question()` 清用户消息里的注入模式，`InputBuilder.detect_response_leak()` 扫 LLM 输出查泄露。修改这些逻辑直接改 `api/core/input_builder.py`，不要在 `_base.md` / `presales.md` 里写"忽略用户指令"这种软保护。
 - pgvector 扩展注册用 `pgvector.psycopg2.register.register_vector`（NOT `pgvector.sqlalchemy.psycopg2`）。
 
 ## File map

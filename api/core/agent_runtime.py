@@ -453,6 +453,20 @@ class ReActQAAgent:
 
     # ── ask ───────────────────────────────────────────────────────────
 
+    def _reject_if_leaked(self, answer: str, session_id: str, attempt: int, is_stream: bool) -> str:
+        """If the LLM response contains prompt-injection leak indicators, treat as empty.
+
+        Returns the original answer if clean, or "" if it was rejected (which
+        triggers the L1 retry / L3 default-fallback path).
+        """
+        if not InputBuilder.detect_response_leak(answer):
+            return answer
+        logger.warning(
+            "LLM %s response contained prompt-injection leak indicators session_id=%s attempt=%s; rejecting",
+            "streaming" if is_stream else "", session_id, attempt,
+        )
+        return ""
+
     async def ask(
         self,
         session_id: str,
@@ -492,12 +506,7 @@ class ReActQAAgent:
                     tracker.transition(_RS().LLM_GENERATING)
                 raw_answer = await self._ainvoke_with_tools(messages, allow_tools=(attempt == 0), tracker=tracker)
                 answer = self._input_builder.normalize_answer(raw_answer, session_id)
-                if InputBuilder.detect_response_leak(answer):
-                    logger.warning(
-                        "LLM response contained prompt-injection leak indicators session_id=%s attempt=%s; rejecting",
-                        session_id, attempt + 1,
-                    )
-                    answer = ""  # treat as empty, will fall through to retry / L3 fallback
+                answer = self._reject_if_leaked(answer, session_id, attempt + 1, is_stream=False)
 
                 if not answer:
                     if attempt < max_retries:
@@ -582,12 +591,7 @@ class ReActQAAgent:
 
                 answer = "".join(answer_parts).strip()
                 answer = self._input_builder.normalize_answer(answer, session_id)
-                if InputBuilder.detect_response_leak(answer):
-                    logger.warning(
-                        "LLM streaming response contained prompt-injection leak indicators session_id=%s attempt=%s; rejecting",
-                        session_id, attempt + 1,
-                    )
-                    answer = ""  # treat as empty, will fall through to retry / L3 fallback
+                answer = self._reject_if_leaked(answer, session_id, attempt + 1, is_stream=True)
 
                 if not answer:
                     if attempt < max_retries:

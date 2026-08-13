@@ -121,10 +121,13 @@ class InputBuilder:
     # (L3 default reply returned instead). Kept narrow on purpose: only signals
     # that are strong evidence of prompt-leak / role-break, not internal code
     # names the LLM might legitimately reference in a tool call.
+    # Substring match (case-insensitive via detect_response_leak). Use plain
+    # lowercase; the matcher lowercases the answer before scanning.
     _LEAK_INDICATORS: tuple[str, ...] = (
         "system prompt", "my system prompt", "my instructions", "my training",
-        "you are an ai", "as an ai language model", "i am an ai", "i am a language model",
-        "<input>",
+        "i am a language model", "i am an ai",
+        "you are an ai",
+        "<input>",  # safe_value data-tag wrapper leaking out
     )
 
     @staticmethod
