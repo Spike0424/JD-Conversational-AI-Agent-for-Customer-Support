@@ -98,6 +98,44 @@ class InputBuilder:
 
     # ── Prompt-injection-safe formatting ──────────────────────────────
 
+    # Patterns that indicate a prompt-injection attempt in user messages.
+    # Matched case-insensitively. Replacing with space preserves word boundaries
+    # so we don't accidentally create new tokens the LLM could act on.
+    _INJECTION_PATTERNS: list[re.Pattern[str]] = [
+        re.compile(p, re.IGNORECASE)
+        for p in [
+            r"ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?|context)",
+            r"忽略\s*(上面|以上|之前|前面|先前)?\s*(所有|全部|任何)?\s*(指令|说明|规则|提示|内容|要求)",
+            r"forget\s+(everything|all|your\s+instructions?)",
+            r"you\s+are\s+(now|actually|really)\s+(a|an)?\s*\w+",
+            r"你现在?是\s*(一?个?|真的?)\s*\S+",
+            r"repeat\s+(your|the)\s+(system\s+)?(prompt|instructions?)",
+            r"(输出|打印|说出|重复)\s*(你的|系统)?\s*(prompt|指令|提示|system\s*prompt)",
+            r"system\s*prompt",
+            r"<\|.*?\|>",  # ChatML special tokens
+            r"\[INST\]|\[/INST\]",  # Llama2 special tokens
+        ]
+    ]
+    # Patterns that indicate the LLM is leaking internal system-prompt fragments
+    # or config to the customer. If any of these appear in the LLM's response,
+    # the response is rejected (L3 default reply returned instead).
+    _LEAK_INDICATORS: tuple[str, ...] = (
+        "<input>", "search_knowledge", "send_product_card", "context_models",
+        "ChannelKwargs", "ContextType", "REACT_SYSTEM_PROMPT", "format_session_info",
+        "_fill_db_placeholders", "fetch_shop_advantages", "fetch_product_knowledge",
+        "agent_runtime", "input_builder", "scene_classifier", "request_state",
+        "ask_stream", "_call_llm_ainvoke", "_call_llm_astream", "ClientError",
+        "_CLIENT_ERROR_MESSAGE", "_L1_RETRY_NUDGE", "_backoff_delay",
+        "ainvoke_with_network_retry", "NETWORK_EXC", "openai.APIStatusError",
+        "FASTEMBED_CACHE_DIR", "HF_HUB_OFFLINE", "ANTHROPIC_", "OPENAI_API_KEY",
+        "OPENAI_BASE_URL", "POSTGRES", "DATABASE_URL", "RAG_ENABLED",
+        "CHAT_RETRIES", "SUPPLIER_RETRIES", "NETWORK_RETRIES",
+        "render_template", "jinja2", "system_message", "you are an ai",
+        "as an ai language model", "i am an ai", "i am a language model",
+        "my instructions", "my system prompt", "my training",
+    )
+    _MAX_USER_QUESTION_CHARS = 2000
+
     @staticmethod
     def safe_value(value: object) -> str:
         """Escape user-supplied values before they're pasted into the system prompt.
@@ -110,6 +148,37 @@ class InputBuilder:
         text = str(value).replace("{", "{{").replace("}", "}}")
         text = text.replace("\n", " ").replace("\r", " ")
         return f"<input>{text}</input>"
+
+    @classmethod
+    def sanitize_user_question(cls, question: str) -> str:
+        """Strip prompt-injection patterns from a user message before sending to LLM.
+
+        Returns the cleaned question. If the question becomes empty after
+        cleaning (everything was injection), returns a placeholder so the
+        LLM still has something to respond to (and won't crash on empty input).
+        """
+        if not question:
+            return ""
+        cleaned = question
+        for pattern in cls._INJECTION_PATTERNS:
+            cleaned = pattern.sub(" ", cleaned)
+        # Collapse whitespace produced by substitutions
+        cleaned = " ".join(cleaned.split())
+        # Truncate to a sane length (prevents prompt-explosion attacks)
+        if len(cleaned) > cls._MAX_USER_QUESTION_CHARS:
+            cleaned = cleaned[: cls._MAX_USER_QUESTION_CHARS].rstrip() + "…"
+        return cleaned or "(empty)"
+
+    @classmethod
+    def detect_response_leak(cls, answer: str) -> bool:
+        """Return True if the LLM response contains fragments that suggest
+        prompt-injection success (system-prompt leakage, internal code/config
+        names, special tokens, or meta-commentary about being an AI).
+        """
+        if not answer:
+            return False
+        lower = answer.lower()
+        return any(indicator.lower() in lower for indicator in cls._LEAK_INDICATORS)
 
     @staticmethod
     def format_session_info(dependencies: dict | None) -> str:
@@ -164,10 +233,11 @@ class InputBuilder:
         system_prompt = await self._fill_db_placeholders(system_prompt, scene, dependencies)
         system_prompt += self.format_session_info(dependencies)
         history = self._session_store.load(session_id=session_id)
+        safe_question = self.sanitize_user_question(question)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             *history,
-            {"role": "user", "content": question},
+            {"role": "user", "content": safe_question},
         ]
         result = await self._compress_history(messages, session_id)
         logger.info(
