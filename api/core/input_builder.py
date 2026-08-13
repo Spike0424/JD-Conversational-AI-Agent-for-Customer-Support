@@ -116,25 +116,16 @@ class InputBuilder:
             r"\[INST\]|\[/INST\]",  # Llama2 special tokens
         ]
     ]
-    # Patterns that indicate the LLM is leaking internal system-prompt fragments
-    # or config to the customer. If any of these appear in the LLM's response,
-    # the response is rejected (L3 default reply returned instead).
+    # Patterns that indicate the LLM is leaking internal system-prompt fragments.
+    # If any of these appear in the LLM's response, the response is rejected
+    # (L3 default reply returned instead). Kept narrow on purpose: only signals
+    # that are strong evidence of prompt-leak / role-break, not internal code
+    # names the LLM might legitimately reference in a tool call.
     _LEAK_INDICATORS: tuple[str, ...] = (
-        "<input>", "search_knowledge", "send_product_card", "context_models",
-        "ChannelKwargs", "ContextType", "REACT_SYSTEM_PROMPT", "format_session_info",
-        "_fill_db_placeholders", "fetch_shop_advantages", "fetch_product_knowledge",
-        "agent_runtime", "input_builder", "scene_classifier", "request_state",
-        "ask_stream", "_call_llm_ainvoke", "_call_llm_astream", "ClientError",
-        "_CLIENT_ERROR_MESSAGE", "_L1_RETRY_NUDGE", "_backoff_delay",
-        "ainvoke_with_network_retry", "NETWORK_EXC", "openai.APIStatusError",
-        "FASTEMBED_CACHE_DIR", "HF_HUB_OFFLINE", "ANTHROPIC_", "OPENAI_API_KEY",
-        "OPENAI_BASE_URL", "POSTGRES", "DATABASE_URL", "RAG_ENABLED",
-        "CHAT_RETRIES", "SUPPLIER_RETRIES", "NETWORK_RETRIES",
-        "render_template", "jinja2", "system_message", "you are an ai",
-        "as an ai language model", "i am an ai", "i am a language model",
-        "my instructions", "my system prompt", "my training",
+        "system prompt", "my system prompt", "my instructions", "my training",
+        "you are an ai", "as an ai language model", "i am an ai", "i am a language model",
+        "<input>",
     )
-    _MAX_USER_QUESTION_CHARS = 2000
 
     @staticmethod
     def safe_value(value: object) -> str:
@@ -164,16 +155,13 @@ class InputBuilder:
             cleaned = pattern.sub(" ", cleaned)
         # Collapse whitespace produced by substitutions
         cleaned = " ".join(cleaned.split())
-        # Truncate to a sane length (prevents prompt-explosion attacks)
-        if len(cleaned) > cls._MAX_USER_QUESTION_CHARS:
-            cleaned = cleaned[: cls._MAX_USER_QUESTION_CHARS].rstrip() + "…"
         return cleaned or "(empty)"
 
     @classmethod
     def detect_response_leak(cls, answer: str) -> bool:
         """Return True if the LLM response contains fragments that suggest
-        prompt-injection success (system-prompt leakage, internal code/config
-        names, special tokens, or meta-commentary about being an AI).
+        prompt-injection success (system-prompt leakage, AI meta-commentary,
+        or the data-tag wrapper leaking out of safe_value).
         """
         if not answer:
             return False
