@@ -29,6 +29,7 @@ dependencies = [
     "pgvector>=0.4.2",
     "jieba>=0.42.1",
     "slowapi>=0.1.9",
+    "pyjwt>=2.8.0",
 ]
 
 [dependency-groups]

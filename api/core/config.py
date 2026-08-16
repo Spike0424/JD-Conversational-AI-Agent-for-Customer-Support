@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     chat_timeout_seconds: int = Field(default=60, alias="CHAT_TIMEOUT_SECONDS")
     chat_retries: int = Field(default=1, alias="CHAT_RETRIES")
     agent_recursion_limit: int = Field(default=6, alias="AGENT_RECURSION_LIMIT")
+    # ── JWT auth ───────────────────────────────────────────────────
+    jwt_secret: str = Field(
+        default="dev-secret-change-me-in-production-32bytes",
+        alias="CHAT_JWT_SECRET",
+    )
+    jwt_expires_seconds: int = Field(default=86400, alias="CHAT_JWT_EXPIRES")
     # ── API 调用 3 层兜底配置 ─────────────────────────────────────────
     # Fallback 模型（不同 provider，5xx 重试耗尽后切换）
     fallback_api_key: str = Field(default="", alias="FALLBACK_API_KEY")

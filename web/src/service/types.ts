@@ -65,3 +65,16 @@ export interface ChatResponse {
 export type ChatMessage =
   | { role: 'user'; content: string }
   | { role: 'assistant'; content: string; product_cards?: ProductCard[] }
+
+// ── Auth ────────────────────────────────────────────────────────────
+
+export interface AuthRequest {
+  email: string
+  password: string
+}
+
+export interface TokenResponse {
+  access_token: string
+  token_type: 'bearer'
+  expires_in: number  // seconds
+}

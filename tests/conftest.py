@@ -35,12 +35,21 @@ def orch_stub() -> MagicMock:
 
 
 @pytest.fixture
-def api_client(orch_stub: MagicMock):
+def auth_token() -> str:
+    """Issue a test JWT for the default test user."""
+    from api.core.auth import issue_token
+    return issue_token("test@example.com")[0]
+
+
+@pytest.fixture
+def api_client(orch_stub: MagicMock, auth_token: str):
     from fastapi.testclient import TestClient
 
     from api.controllers.deps import get_orchestrator
     from api.main import app
 
     app.dependency_overrides[get_orchestrator] = lambda: orch_stub
-    yield TestClient(app)
+    client = TestClient(app)
+    client.headers["Authorization"] = f"Bearer {auth_token}"
+    yield client
     app.dependency_overrides.clear()

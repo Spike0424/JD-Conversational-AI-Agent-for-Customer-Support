@@ -8,7 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from api.controllers.deps import get_orchestrator
+from api.controllers.deps import get_orchestrator, verify_chat_token
 from api.controllers.rate_limit import limiter
 from api.core.config import get_settings
 from api.core.agent_runtime import ClientError, _CLIENT_ERROR_MESSAGE
@@ -134,7 +134,11 @@ async def _streaming_response_for_question(
             )
             yield f"data: {error}\n\n"
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 def _parse_get_chat_params(
@@ -156,7 +160,11 @@ def _parse_get_chat_params(
 
 @router.post("/chat", response_model=ChatResponse)
 @router.post("/v1/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, orchestrator: ChatOrchestrator = Depends(get_orchestrator)) -> ChatResponse | JSONResponse:
+async def chat(
+    request: ChatRequest,
+    email: str = Depends(verify_chat_token),
+    orchestrator: ChatOrchestrator = Depends(get_orchestrator),
+) -> ChatResponse | JSONResponse:
     return await _chat_async(request.session_id, request.question, request.context, orchestrator)
 
 
@@ -182,6 +190,7 @@ async def chat_get(
 async def chat_stream(
     request: Request,
     body: ChatRequest,
+    email: str = Depends(verify_chat_token),
     orchestrator: ChatOrchestrator = Depends(get_orchestrator),
 ) -> StreamingResponse:
     return await _streaming_response_for_question(body.session_id, body.question, body.context, orchestrator)
@@ -192,6 +201,7 @@ async def chat_stream(
 async def chat_stream_get(
     session_id: str | None = Query(None),
     question: str | None = Query(None),
+    email: str = Depends(verify_chat_token),
     orchestrator: ChatOrchestrator = Depends(get_orchestrator),
 ) -> StreamingResponse | JSONResponse:
     parsed = _parse_get_chat_params(session_id, question)
