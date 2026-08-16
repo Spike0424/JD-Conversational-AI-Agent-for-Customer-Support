@@ -1,7 +1,7 @@
-"""InputBuilder — constructs LLM input messages from session state and dependencies.
+"""InputBuilder - constructs LLM input messages from session state and dependencies.
 
 Extracted from ReActQAAgent to separate message-building concerns from
-agent execution concerns.  Owns: scene prompt loading, session-info formatting,
+agent execution concerns. Owns: scene prompt loading, session-info formatting,
 history compression, user persistence, and the combined message construction.
 """
 
@@ -59,11 +59,12 @@ class InputBuilder:
     # ── Scene prompt loading ──────────────────────────────────────────
 
     def load_scene_prompt(self, scene: str) -> str:
-        """Load system prompt = _base.md + {scene}.md, fallback to REACT_SYSTEM_PROMPT.
+        """Load and cache scene prompt (_base.md + {scene}.md).
 
-        _base.md is always loaded (role / strategy / tool rules / anti-injection).
-        The scene file is appended after it; if scene is empty or file missing,
-        only base is used.  Cached per scene after first load.
+        args:
+            scene: scene name (presale/insale/aftersale/mixed).
+
+        returns: combined prompt text, cached per scene.
         """
         cache_key = (scene or "").strip()
         if cache_key in self._prompt_cache:
@@ -132,10 +133,12 @@ class InputBuilder:
 
     @staticmethod
     def safe_value(value: object) -> str:
-        """Escape user-supplied values before they're pasted into the system prompt.
+        """Wrap a value in <input> tags so the LLM treats it as data.
 
-        Wraps in <input> tags so the LLM treats it as data, not instructions,
-        and doubles braces so it can't break out of an outer f-string template.
+        args:
+            value: any value to embed in the system prompt.
+
+        returns: escaped string in <input>...</input> tags.
         """
         if value is None:
             return ""
@@ -145,11 +148,12 @@ class InputBuilder:
 
     @classmethod
     def sanitize_user_question(cls, question: str) -> str:
-        """Strip prompt-injection patterns from a user message before sending to LLM.
+        """Strip prompt-injection patterns from a user message.
 
-        Returns the cleaned question. If the question becomes empty after
-        cleaning (everything was injection), returns a placeholder so the
-        LLM still has something to respond to (and won't crash on empty input).
+        args:
+            question: raw user input.
+
+        returns: cleaned question; "(empty)" if everything was injection.
         """
         if not question:
             return ""
@@ -162,9 +166,12 @@ class InputBuilder:
 
     @classmethod
     def detect_response_leak(cls, answer: str) -> bool:
-        """Return True if the LLM response contains fragments that suggest
-        prompt-injection success (system-prompt leakage, AI meta-commentary,
-        or the data-tag wrapper leaking out of safe_value).
+        """Check if an LLM response contains prompt-leak indicators.
+
+        args:
+            answer: LLM response text.
+
+        returns: True if answer suggests prompt-injection success.
         """
         if not answer:
             return False
@@ -173,7 +180,13 @@ class InputBuilder:
 
     @staticmethod
     def format_session_info(dependencies: dict | None) -> str:
-        """Build 【当前会话信息】 block, attached at end of system prompt."""
+        """Build the Current-Session-Info block for the system prompt.
+
+        args:
+            dependencies: context dict (shop_id, goods_id, order_sn, ...).
+
+        returns: formatted multi-line string, or "" if empty.
+        """
         if not dependencies:
             return ""
 
@@ -219,7 +232,16 @@ class InputBuilder:
         scene: str = "",
         dependencies: dict | None = None,
     ) -> list[dict[str, str]]:
-        """Assemble the full message list sent to the LLM on each turn."""
+        """Assemble the LLM message list for one turn.
+
+        args:
+            session_id: conversation ID.
+            question: raw user input.
+            scene: scene name.
+            dependencies: context dict.
+
+        returns: [system, ...history, user] message list for LLM.
+        """
         system_prompt = self.load_scene_prompt(scene)
         system_prompt = await self._fill_db_placeholders(system_prompt, scene, dependencies)
         system_prompt += self.format_session_info(dependencies)
@@ -240,10 +262,14 @@ class InputBuilder:
     async def _fill_db_placeholders(
         self, prompt: str, scene: str, dependencies: dict | None
     ) -> str:
-        """Replace [DB_*] placeholders with actual KB data before sending to LLM.
+        """Pre-RAG: fill [DB_*] placeholders with KB data from cache.
 
-        Empty placeholders are blanked out so the LLM doesn't try to fill them
-        by calling search_knowledge.  KB queries run in parallel via to_thread.
+        args:
+            prompt: scene prompt with [DB_*] placeholders.
+            scene: scene name for KB lookup.
+            dependencies: context dict (for shop_id, goods_id).
+
+        returns: prompt with placeholders replaced by KB data.
         """
         if "[DB_" not in prompt:
             return prompt
@@ -285,12 +311,13 @@ class InputBuilder:
     async def _compress_history(
         self, messages: list[dict[str, str]], session_id: str
     ) -> list[dict[str, str]]:
-        """Compress old messages into a summary when token count exceeds threshold.
+        """Compress old messages via agens LLM if token count exceeds threshold.
 
-        The system prompt (first message with role=system) is always preserved
-        in the output and excluded from compression scope.  The compressed summary
-        is returned inline but NOT persisted to the session store — persisting it
-        would create duplicate system-role content on subsequent turns.
+        args:
+            messages: full message list (system + history + user).
+            session_id: for agens LLM call logging.
+
+        returns: message list with old messages replaced by summary.
         """
         if not self._agens_llm:
             return messages
@@ -362,6 +389,12 @@ class InputBuilder:
     # ── User messages persistence ─────────────────────────────────────
 
     def persist_user(self, session_id: str, question: str) -> None:
+        """Save the user message to the session store.
+
+        args:
+            session_id: conversation ID.
+            question: user's raw message.
+        """
         self._session_store.append(session_id=session_id, role="user", content=question)
 
     # ── Output normalization ──────────────────────────────────────────
@@ -371,10 +404,15 @@ class InputBuilder:
         return re.sub(r"\s+", " ", text.strip())
 
     def normalize_answer(self, raw: str, session_id: str) -> str:
-        """Filter internal terms, dedup against last assistant message, persist to history.
+        """Clean and validate the LLM answer (strip noise, persist).
 
-        L4: empty answer is NOT persisted to history (avoids polluting future context).
+        args:
+            raw: raw LLM answer text.
+            session_id: for persistence.
+
+        returns: cleaned answer; "" if answer was noise/empty.
         """
+        # L4: empty answer is NOT persisted to history (avoids polluting future context).
         filtered = raw
         for word in self._settings.output_filter_words:
             filtered = filtered.replace(word, "")

@@ -20,6 +20,13 @@ GREETINGS = {"hi", "hello", "在吗", "你好", "有人吗", "在不在", "喂",
 
 
 def _is_greeting(text: str) -> bool:
+    """Check if text is a simple greeting (hi/你好/etc).
+
+    args:
+        text: user input.
+
+    returns: True if text matches a greeting in the GREETINGS set.
+    """
     return text.strip().lower() in GREETINGS
 
 
@@ -34,7 +41,14 @@ _WELCOME_MESSAGE = """您好！终于等到您，欢迎光临本店！
 
 
 def _context_to_dependencies(context: Context, raw_query: str) -> dict[str, Any]:
-    """把 Context + 解析后的 raw_query 拼成依赖字典，给 scene_classifier 和 agent 用。"""
+    """Build the dependencies dict from Context + parsed raw query.
+
+    args:
+        context: parsed Context from turn parsing.
+        raw_query: cleaned customer text.
+
+    returns: dict for scene_classifier and agent.
+    """
     kw: ChannelKwargs = context.kwargs
     deps: dict[str, Any] = {
         "shop_id": kw.shop_id,
@@ -62,9 +76,23 @@ class ChatOrchestrator:
 
     @staticmethod
     def _scene_metadata(scene: str) -> dict[str, str]:
+        """Look up scene display label.
+
+        args:
+            scene: scene key.
+
+        returns: {"scene": str, "scene_label": str} dict.
+        """
         return {"scene": scene, "scene_label": CUSTOMER_SCENE_LABELS.get(scene, scene)}
 
     def _wire_search_context(self, session_id: str, scene: str, deps: dict[str, Any]) -> None:
+        """Set shop/product context on the global SearchKnowledge.
+
+        args:
+            session_id: for retrieving recent user messages.
+            scene: current scene.
+            deps: {"shop_id", "goods_id", "goods_name"} for RAG.
+        """
         shop_id = deps.get("shop_id")
         goods_id = deps.get("goods_id")
         sk = get_search_knowledge()
@@ -74,7 +102,14 @@ class ChatOrchestrator:
 
     @staticmethod
     def _rewrite_question(question: str, deps: dict[str, Any]) -> str:
-        """Replace vague references like '这手机' with the actual goods_name from context."""
+        """Replace vague references (这手机) with the actual goods_name.
+
+        args:
+            question: raw user input.
+            deps: context dict (must contain goods_name).
+
+        returns: question with vague refs replaced.
+        """
         goods_name = deps.get("goods_name")
         if not goods_name:
             return question
@@ -89,6 +124,16 @@ class ChatOrchestrator:
         context: Context | None = None,
         dependencies: dict[str, Any] | None = None,
     ) -> ChatResponse:
+        """Process one non-streaming chat turn (short-circuit + LLM).
+
+        args:
+            session_id: conversation ID.
+            question: raw user input.
+            context: parsed Context (type/kwargs).
+            dependencies: pre-extracted context (shop_id, etc).
+
+        returns: full ChatResponse (answer, intent, citations, etc).
+        """
         trace_id = uuid.uuid4().hex
         tracker = RequestTracker(session_id, trace_id)
         tracker.transition(RequestState.RECEIVED, context_type=context.type.value if context else "text")
@@ -212,6 +257,16 @@ class ChatOrchestrator:
         context: Context | None = None,
         dependencies: dict[str, Any] | None = None,
     ) -> tuple[str, str, list, list[str], AsyncIterator[str], str]:
+        """Process one streaming chat turn (short-circuit + LLM stream).
+
+        args:
+            session_id: conversation ID.
+            question: raw user input.
+            context: parsed Context (type/kwargs).
+            dependencies: pre-extracted context (shop_id, etc).
+
+        returns: (trace_id, scene, citations, actions, chunk_iter, layer).
+        """
         trace_id = uuid.uuid4().hex
         tracker = RequestTracker(session_id, trace_id)
         tracker.transition(RequestState.RECEIVED, context_type=context.type.value if context else "text")
@@ -277,6 +332,15 @@ class ChatOrchestrator:
         )
 
     def handoff(self, session_id: str, reason: str, priority: str) -> HandoffResponse:
+        """Transfer the conversation to a human agent (mocked).
+
+        args:
+            session_id: conversation ID.
+            reason: why transferring.
+            priority: 'low' | 'normal' | 'high'.
+
+        returns: HandoffResponse with ticket_id and queue.
+        """
         ticket_id = f"TKT-{uuid.uuid4().hex[:10].upper()}"
         queue = "vip" if priority.lower() == "high" else "standard"
         return HandoffResponse(

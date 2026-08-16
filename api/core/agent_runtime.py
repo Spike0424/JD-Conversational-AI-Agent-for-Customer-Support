@@ -54,11 +54,25 @@ def _RS():
 
 
 def _append_retry_nudge(messages: list[dict]) -> list[dict]:
+    """Append L1 retry nudge to messages (mutates in place).
+
+    args:
+        messages: current message list (mutated in place).
+
+    returns: the same messages list (for chaining).
+    """
     messages.append({"role": "system", "content": _L1_RETRY_NUDGE})
     return messages
 
 
 def _thinking_extra_body(settings) -> dict[str, Any] | None:
+    """Build the LLM request body for thinking-mode control.
+
+    args:
+        settings: app settings (chat_thinking_mode, openai_base_url).
+
+    returns: extra_body dict to disable/enable thinking, or None.
+    """
     mode = (settings.chat_thinking_mode or "auto").strip().lower()
     base = (settings.openai_base_url or "").lower()
     if mode == "auto" and "deepseek.com" in base:
@@ -127,7 +141,14 @@ class ReActQAAgent:
     async def _call_llm_ainvoke(
         self, llm: ChatOpenAI, messages: list,
     ) -> Any:
-        """3-tier error handling for ainvoke: 4xx stop / 5xx retry+fallback / network retry."""
+        """Call llm.ainvoke with 3-tier error handling.
+
+        args:
+            llm: ChatOpenAI instance (primary or fallback).
+            messages: prompt messages in OpenAI format.
+
+        returns: LLM response object.
+        """
         supplier_retries = self._settings.supplier_retries
         for attempt in range(supplier_retries + 1):
             try:
@@ -158,10 +179,13 @@ class ReActQAAgent:
     async def _call_llm_astream(
         self, llm: ChatOpenAI, messages: list,
     ) -> tuple[Any, Any]:
-        """3-tier error handling for astream_events. Retries only before first event.
+        """Call llm.astream_events with 3-tier error handling.
 
-        Returns (gen, first_event) on success. Caller must continue iterating gen.
-        Raises ClientError on 4xx, or the last exception on retry exhaustion.
+        args:
+            llm: ChatOpenAI instance (primary or fallback).
+            messages: prompt messages in OpenAI format.
+
+        returns: (async_gen, first_event) — caller iterates gen for rest.
         """
         supplier_retries = self._settings.supplier_retries
         network_retries = self._settings.network_retries
@@ -217,6 +241,10 @@ class ReActQAAgent:
     # ── Tool wiring ───────────────────────────────────────────────────
 
     def _build_langchain_tools(self) -> list:
+        """Wrap registered @agent_tool entries as LangChain tool objects.
+
+        returns: list of LangChain tool callables.
+        """
         result: list = []
         for entry in get_registered_tools():
             if entry.param_model is not None:
@@ -231,6 +259,14 @@ class ReActQAAgent:
         return result
 
     def _execute_tool_call(self, tool_call: Any, tracker: RequestTracker | None) -> str:
+        """Execute a single tool call synchronously (caller wraps in to_thread).
+
+        args:
+            tool_call: LangChain tool_call object/dict with name + args.
+            tracker: request state tracker (for transition logging).
+
+        returns: tool output string, or error message on failure.
+        """
         name = getattr(tool_call, "name", "") or (tool_call.get("name", "") if isinstance(tool_call, dict) else "")
         args = getattr(tool_call, "args", {}) or (tool_call.get("args", {}) if isinstance(tool_call, dict) else {})
         RS = _RS()
@@ -276,6 +312,14 @@ class ReActQAAgent:
     # ── L2 fallback ───────────────────────────────────────────────────
 
     def _fallback_to_knowledge_base(self, question: str, scene: str) -> str:
+        """L2 fallback: search KB and return formatted result.
+
+        args:
+            question: user's question to search.
+            scene: current scene.
+
+        returns: KB result prefixed with intro, or "" if no result.
+        """
         try:
             sk = get_search_knowledge()
             if sk is None:
@@ -311,6 +355,12 @@ class ReActQAAgent:
 
     @staticmethod
     def _log_llm_messages(lc_messages: list, label: str) -> None:
+        """Log the LLM message list (for debug).
+
+        args:
+            lc_messages: list of LangChain message objects.
+            label: tag for the log line.
+        """
         parts = []
         for i, msg in enumerate(lc_messages):
             role = msg.__class__.__name__.replace("Message", "")
@@ -329,10 +379,14 @@ class ReActQAAgent:
         allow_tools: bool,
         tracker: RequestTracker | None,
     ) -> str:
-        """Call LLM. If allow_tools and LLM requests tools, execute them once
-        and call LLM again (no tools) to produce final answer.
+        """Non-streaming LLM call with optional tool execution.
 
-        On L1 retry, allow_tools=False to prevent re-executing tools.
+        args:
+            messages: prompt messages in OpenAI format.
+            allow_tools: whether LLM may call tools (False on L1 retry).
+            tracker: request state tracker.
+
+        returns: final assistant text (after tools if any).
         """
         lc_messages = convert_to_messages(messages)
         llm = self._llm_with_tools if allow_tools else self._llm
@@ -347,8 +401,10 @@ class ReActQAAgent:
             return self._extract_text(getattr(response, "content", ""))
 
         lc_messages.append(response)
-        for tc in tool_calls:
-            output = self._execute_tool_call(tc, tracker)
+        tool_outputs = await asyncio.gather(
+            *(asyncio.to_thread(self._execute_tool_call, tc, tracker) for tc in tool_calls)
+        )
+        for tc, output in zip(tool_calls, tool_outputs):
             tc_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
             lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
 
@@ -361,23 +417,20 @@ class ReActQAAgent:
         messages: list[dict],
         tracker: RequestTracker | None,
     ) -> AsyncIterator[str]:
-        """真流式输出：astream_events 逐 token yield。
+        """Streaming LLM call with optional tool execution.
 
-        策略：
-        1. 先用 astream_events 流式调 llm_with_tools
-           - 如果 LLM 直接输出文本 -> 逐 token yield（最常见场景，真流式）
-           - 如果 LLM 要调 tool -> 不会有文本 token，只有 tool_calls
-        2. 检查 astream_events 结束后是否有 tool_calls
-           - 有 -> 执行 tool，追加 ToolMessage，再 astream_events 流式输出最终回答
-           - 无 -> 已经 yield 完了，直接返回
+        args:
+            messages: prompt messages in OpenAI format.
+            tracker: request state tracker.
 
-        3-tier 错误处理只在第一个 event 之前生效；mid-stream 错误只 log + yield 提示。
+        yields: text deltas from the LLM response.
         """
         lc_messages = convert_to_messages(messages)
 
-        # Phase 1: 流式调用 llm_with_tools，逐 token yield
+        # Phase 1: 流式调用 llm_with_tools，缓冲文本 + 收集 tool_calls
         collected_tool_calls: list = []
         final_response: Any = None
+        phase1_buffer: list[str] = []
 
         gen, first_event = await self._call_llm_astream(self._llm_with_tools, lc_messages)
         try:
@@ -389,7 +442,7 @@ class ReActQAAgent:
                         continue
                     text = self._extract_text(getattr(chunk, "content", ""))
                     if text:
-                        yield text
+                        phase1_buffer.append(text)  # ← 缓冲，不 yield
                 elif kind == "on_chat_model_end":
                     final_response = event.get("data", {}).get("output")
                     if final_response:
@@ -400,12 +453,17 @@ class ReActQAAgent:
             return
 
         if not collected_tool_calls:
+            # LLM 没调工具：phase1_buffer 就是最终答案，逐段 yield
+            for t in phase1_buffer:
+                yield t
             return
 
-        # Phase 2: 有 tool 调用 -> 执行 tool，再流式输出最终回答
+        # Phase 2: 有 tool 调用，丢弃 phase1_buffer，并发 await 获取 context，再流式输出最终回答
         lc_messages.append(final_response)
-        for tc in collected_tool_calls:
-            output = self._execute_tool_call(tc, tracker)
+        tool_outputs = await asyncio.gather(
+            *(asyncio.to_thread(self._execute_tool_call, tc, tracker) for tc in collected_tool_calls)
+        )
+        for tc, output in zip(collected_tool_calls, tool_outputs):
             tc_id = getattr(tc, "id", "") or (tc.get("id", "") if isinstance(tc, dict) else "")
             lc_messages.append(ToolMessage(content=output, tool_call_id=tc_id or "unknown"))
 
@@ -433,7 +491,17 @@ class ReActQAAgent:
         tracker: RequestTracker | None,
         is_stream: bool,
     ) -> str:
-        """L2 (knowledge base) -> L3 (default reply) fallback. Used by both ask() and ask_stream()."""
+        """Resolve L2 -> L3 fallback (KB search -> default reply).
+
+        args:
+            question: user's question.
+            scene: current scene.
+            last_err: last exception from LLM call (for logging).
+            tracker: request state tracker.
+            is_stream: True for streaming path (affects log msg).
+
+        returns: L2 KB result, or L3 default reply if KB empty.
+        """
         RS = _RS()
         answer = self._fallback_to_knowledge_base(question, scene)
         if tracker and answer:
@@ -454,10 +522,15 @@ class ReActQAAgent:
     # ── ask ───────────────────────────────────────────────────────────
 
     def _reject_if_leaked(self, answer: str, session_id: str, attempt: int, is_stream: bool) -> str:
-        """If the LLM response contains prompt-injection leak indicators, treat as empty.
+        """Return "" if answer contains prompt-injection leak indicators.
 
-        Returns the original answer if clean, or "" if it was rejected (which
-        triggers the L1 retry / L3 default-fallback path).
+        args:
+            answer: LLM response text.
+            session_id: for log correlation.
+            attempt: retry attempt number (for log).
+            is_stream: True for streaming path (affects log msg).
+
+        returns: "" if rejected, else original answer.
         """
         if not InputBuilder.detect_response_leak(answer):
             return answer
@@ -475,6 +548,17 @@ class ReActQAAgent:
         dependencies: dict | None = None,
         tracker: RequestTracker | None = None,
     ) -> str:
+        """Non-streaming chat turn with L1 retry and L2/L3 fallback.
+
+        args:
+            session_id: conversation ID.
+            question: user's message.
+            scene: detected scene (presale/insale/aftersale).
+            dependencies: context (shop_id, goods_id, order_sn, ...).
+            tracker: request state tracker.
+
+        returns: final assistant text (or L3 default reply on failure).
+        """
         logger.info(
             "══════════════════ Q&A ── session=%s scene=%s ── question=%s ══════════════════",
             session_id, scene, question,
@@ -558,6 +642,17 @@ class ReActQAAgent:
         dependencies: dict | None = None,
         tracker: RequestTracker | None = None,
     ) -> AsyncIterator[str]:
+        """Streaming chat turn with L1 retry and L2/L3 fallback.
+
+        args:
+            session_id: conversation ID.
+            question: user's message.
+            scene: detected scene (presale/insale/aftersale).
+            dependencies: context (shop_id, goods_id, order_sn, ...).
+            tracker: request state tracker.
+
+        yields: assistant text deltas (or L3 default reply on failure).
+        """
         logger.info(
             "══════════════════ Q&A (stream) ── session=%s scene=%s ── question=%s ══════════════════",
             session_id, scene, question,
