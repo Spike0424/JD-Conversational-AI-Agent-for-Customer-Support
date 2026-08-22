@@ -2,6 +2,8 @@ import type {
   AuthRequest,
   ChatContext,
   ProductInfo,
+  SessionInfo,
+  SessionMessagesResponse,
   ShopInfo,
   TokenResponse,
 } from './types'
@@ -51,6 +53,30 @@ export async function fetchProducts(shopId: number, q: string): Promise<ProductI
   const r = await fetch(`${API_BASE}/v1/products?${params}`)
   if (!r.ok) throw new Error(`fetchProducts failed: ${r.status}`)
   return r.json()
+}
+
+// ── Sessions (authed) ───────────────────────────────────────────────
+
+export async function fetchSessions(): Promise<SessionInfo[]> {
+  const r = await authedFetch(`${API_BASE}/v1/sessions`)
+  if (!r.ok) throw new Error(`fetchSessions failed: ${r.status}`)
+  const data = (await r.json()) as { sessions: SessionInfo[] }
+  return data.sessions
+}
+
+export async function fetchSessionMessages(sessionId: string): Promise<SessionMessagesResponse> {
+  const r = await authedFetch(`${API_BASE}/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
+  if (r.status === 404) throw new Error('会话不存在')
+  if (!r.ok) throw new Error(`fetchSessionMessages failed: ${r.status}`)
+  return r.json()
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  const r = await authedFetch(`${API_BASE}/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE',
+  })
+  if (r.status === 404) throw new Error('会话不存在')
+  if (!r.ok) throw new Error(`deleteSession failed: ${r.status}`)
 }
 
 // ── Auth (register / login) ───────────────────────────────────────
