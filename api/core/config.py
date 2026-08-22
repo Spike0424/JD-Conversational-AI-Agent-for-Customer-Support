@@ -52,6 +52,9 @@ class Settings(BaseSettings):
     chat_thinking_mode: str = Field(default="auto", alias="CHAT_THINKING_MODE")
     chat_timeout_seconds: int = Field(default=60, alias="CHAT_TIMEOUT_SECONDS")
     chat_retries: int = Field(default=1, alias="CHAT_RETRIES")
+    # Cap answer length. The model is sluggish (~75 tok/s on this provider), so
+    # permissive defaults lead to 6-7s responses. 400 keeps answers focused.
+    chat_max_tokens: int = Field(default=400, alias="CHAT_MAX_TOKENS")
     agent_recursion_limit: int = Field(default=6, alias="AGENT_RECURSION_LIMIT")
     # ── JWT auth ───────────────────────────────────────────────────
     jwt_secret: str = Field(

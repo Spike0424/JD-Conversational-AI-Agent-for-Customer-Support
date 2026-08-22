@@ -70,11 +70,13 @@ async def _with_retry_async(coro_factory: Callable[[], Any], error_code: str) ->
 
 
 async def _chat_async(
-    session_id: str, question: str, context, orchestrator: ChatOrchestrator,
+    session_id: str, question: str, context, orchestrator: ChatOrchestrator, email: str,
 ) -> ChatResponse | JSONResponse:
     try:
         return await _with_retry_async(
-            lambda: orchestrator.chat(session_id=session_id, question=question, context=context),
+            lambda: orchestrator.chat(
+                session_id=session_id, question=question, context=context, user_id=email,
+            ),
             "CHAT",
         )
     except ValueError as exc:
@@ -82,12 +84,12 @@ async def _chat_async(
 
 
 async def _streaming_response_for_question(
-    session_id: str, question: str, context, orchestrator: ChatOrchestrator
+    session_id: str, question: str, context, orchestrator: ChatOrchestrator, email: str,
 ) -> StreamingResponse:
     trace_id = uuid.uuid4().hex
     try:
         trace_id, intent, citations, actions, chunks, _layer = await orchestrator.stream_chat(
-            session_id=session_id, question=question, context=context
+            session_id=session_id, question=question, context=context, user_id=email,
         )
     except ValueError as exc:
         return StreamingResponse(
@@ -165,7 +167,9 @@ async def chat(
     email: str = Depends(verify_chat_token),
     orchestrator: ChatOrchestrator = Depends(get_orchestrator),
 ) -> ChatResponse | JSONResponse:
-    return await _chat_async(request.session_id, request.question, request.context, orchestrator)
+    return await _chat_async(
+        request.session_id, request.question, request.context, orchestrator, email,
+    )
 
 
 @router.get("/chat", response_model=None)
@@ -193,7 +197,9 @@ async def chat_stream(
     email: str = Depends(verify_chat_token),
     orchestrator: ChatOrchestrator = Depends(get_orchestrator),
 ) -> StreamingResponse:
-    return await _streaming_response_for_question(body.session_id, body.question, body.context, orchestrator)
+    return await _streaming_response_for_question(
+        body.session_id, body.question, body.context, orchestrator, email,
+    )
 
 
 @router.get("/chat/stream", response_model=None)
