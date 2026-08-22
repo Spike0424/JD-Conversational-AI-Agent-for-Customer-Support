@@ -50,5 +50,9 @@ node_modules/
 # 售后政策文件
 doc/
 
-#
+#md
 Readme.md
+
+#test
+tests/
+test-result/
