@@ -66,6 +66,21 @@ export type ChatMessage =
   | { role: 'user'; content: string }
   | { role: 'assistant'; content: string; product_cards?: ProductCard[] }
 
+// ── Sessions (sidebar history) ──────────────────────────────────────
+
+export interface SessionInfo {
+  session_id: string
+  title: string
+  created_at: string
+  last_message_at: string
+  message_count: number
+}
+
+export interface SessionMessagesResponse {
+  session_id: string
+  messages: { role: string; content: string; timestamp: string }[]
+}
+
 // ── Auth ────────────────────────────────────────────────────────────
 
 export interface AuthRequest {

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import {
   clearToken,
   getToken,
@@ -7,9 +7,27 @@ import {
   setToken,
 } from '../service/api'
 
+/**
+ * Decode the `sub` claim from a JWT without verifying the signature.
+ * The backend already validates the token on every request; we just
+ * need the email to display it in the sidebar user popover.
+ */
+function decodeEmail(token: string | null): string | null {
+  if (!token) return null
+  const parts = token.split('.')
+  if (parts.length < 2) return null
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as { sub?: string }
+    return payload.sub ?? null
+  } catch {
+    return null
+  }
+}
+
 export function useAuth() {
   const [token, setTokenState] = useState<string | null>(getToken())
   const isLoggedIn = !!token
+  const email = useMemo(() => decodeEmail(token), [token])
 
   const doLogin = useCallback(async (email: string, password: string) => {
     const data = await apiLogin(email, password)
@@ -30,5 +48,5 @@ export function useAuth() {
     setTokenState(null)
   }, [])
 
-  return { token, isLoggedIn, login: doLogin, register: doRegister, logout: doLogout }
+  return { token, isLoggedIn, email, login: doLogin, register: doRegister, logout: doLogout }
 }
