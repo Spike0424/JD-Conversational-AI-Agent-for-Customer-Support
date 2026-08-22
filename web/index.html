@@ -4,6 +4,45 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>客服咨询</title>
+    <style>
+      :root {
+        --bg-canvas: #0a0a0a;
+        --bg-elevated: #1a1a1a;
+        --bg-sider: #000000;
+        --bg-input: #1a1a1a;
+        --text-primary: #ffffff;
+        --text-secondary: #a0a0a0;
+        --text-muted: #5e5e5e;
+        --border-subtle: #1a1a1a;
+        --color-primary: #4d9aff;
+      }
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: var(--bg-canvas);
+        color: var(--text-primary);
+      }
+      html {
+        /* Belt-and-suspenders against Edge font inflation: pin the root
+           font-size so every rem-derived size stays at 14px regardless of
+           browser text autosizing or zoom quirks. */
+        font-size: 14px;
+        text-size-adjust: 100%;
+        -webkit-text-size-adjust: 100%;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+          'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial,
+          sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-size-adjust: 100%;
+        -webkit-text-size-adjust: 100%;
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
