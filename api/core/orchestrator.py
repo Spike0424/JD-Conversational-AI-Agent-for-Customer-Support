@@ -123,6 +123,7 @@ class ChatOrchestrator:
         question: str,
         context: Context | None = None,
         dependencies: dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> ChatResponse:
         """Process one non-streaming chat turn (short-circuit + LLM).
 
@@ -236,6 +237,8 @@ class ChatOrchestrator:
             question=effective_question,
             scene=scene,
             dependencies=deps, tracker=tracker,
+            user_id=user_id,
+            goods_name=deps.get("goods_name"),
         )
         tracker.transition(RequestState.RESPONSE_SENT)
         product_cards = self._agent.pop_product_cards(session_id)
@@ -256,6 +259,7 @@ class ChatOrchestrator:
         question: str,
         context: Context | None = None,
         dependencies: dict[str, Any] | None = None,
+        user_id: str | None = None,
     ) -> tuple[str, str, list, list[str], AsyncIterator[str], str]:
         """Process one streaming chat turn (short-circuit + LLM stream).
 
@@ -297,16 +301,39 @@ class ChatOrchestrator:
             deps.update(dependencies)
 
         # ── 问候语命中 -> 直接返回，跳过 scene_classifier 和 LLM ──
+        # 仍然 persist 双方消息，让"hi"这种简单轮次也能进历史会话。
         effective_question = turn_ctx.customer_text.strip() or question
         if _is_greeting(effective_question):
+            goods_name = deps.get("goods_name")
+            self._agent._input_builder.persist_user(
+                session_id=session_id,
+                question=effective_question,
+                user_id=user_id,
+                goods_name=goods_name,
+            )
+
             async def _greeting_stream() -> AsyncIterator[str]:
                 yield _WELCOME_MESSAGE
+
+            async def _greeting_persist_then_iter() -> AsyncIterator[str]:
+                # Stream the template first so the client sees the reply
+                # immediately; after the consumer drains, save the reply row.
+                buf: list[str] = []
+                async for chunk in _greeting_stream():
+                    buf.append(chunk)
+                    yield chunk
+                self._agent._input_builder.normalize_answer(
+                    raw="".join(buf),
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+
             return (
                 trace_id,
                 "greeting",
                 [],
                 [],
-                _greeting_stream(),
+                _greeting_persist_then_iter(),
                 "GREETING",
             )
 
@@ -326,7 +353,13 @@ class ChatOrchestrator:
             [],
             [],
             self._agent.ask_stream(
-                session_id=session_id, question=effective_question, scene=scene, dependencies=deps, tracker=tracker,
+                session_id=session_id,
+                question=effective_question,
+                scene=scene,
+                dependencies=deps,
+                tracker=tracker,
+                user_id=user_id,
+                goods_name=deps.get("goods_name"),
             ),
             "LLM",
         )
