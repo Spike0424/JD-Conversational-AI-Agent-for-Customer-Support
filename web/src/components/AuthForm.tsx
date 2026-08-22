@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Button, Card, Form, Input, Typography } from 'antd'
+import { Alert, Button, Form, Input, Typography } from 'antd'
 
 const { Title } = Typography
 
@@ -11,6 +11,10 @@ interface AuthFormProps {
   onSwitchMode: () => void
 }
 
+/**
+ * Bare form content (no Card wrapper). The ChatLayout wraps this in a Modal
+ * so the same form works for both first-time login and 401-triggered reauth.
+ */
 export function AuthForm({ mode, onSubmit, onSwitchMode }: AuthFormProps) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -31,16 +35,12 @@ export function AuthForm({ mode, onSubmit, onSwitchMode }: AuthFormProps) {
   }
 
   return (
-    <Card style={{ maxWidth: 400, margin: '80px auto' }}>
-      <Title level={3} style={{ textAlign: 'center' }}>
+    <div>
+      <Title level={4} style={{ textAlign: 'center', marginBottom: 24 }}>
         {mode === 'login' ? '登录' : '注册'}
       </Title>
       <Form layout="vertical" onFinish={handleSubmit} disabled={loading}>
-        <Form.Item
-          label="邮箱"
-          validateStatus={error ? 'error' : ''}
-          help={error || ''}
-        >
+        <Form.Item label="邮箱">
           <Input
             type="email"
             value={email}
@@ -55,7 +55,12 @@ export function AuthForm({ mode, onSubmit, onSwitchMode }: AuthFormProps) {
             autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
           />
         </Form.Item>
-        <Form.Item>
+        {error && (
+          <Form.Item style={{ marginBottom: 16 }}>
+            <Alert type="error" message={error} showIcon />
+          </Form.Item>
+        )}
+        <Form.Item style={{ marginBottom: 8 }}>
           <Button type="primary" htmlType="submit" loading={loading} block>
             {mode === 'login' ? '登录' : '注册'}
           </Button>
@@ -64,6 +69,6 @@ export function AuthForm({ mode, onSubmit, onSwitchMode }: AuthFormProps) {
           {mode === 'login' ? '没有账号？去注册' : '已有账号？去登录'}
         </Button>
       </Form>
-    </Card>
+    </div>
   )
 }
