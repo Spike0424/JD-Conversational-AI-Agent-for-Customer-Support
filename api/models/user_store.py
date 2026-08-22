@@ -1,37 +1,55 @@
-"""In-memory user registry (email -> password_hash). Replace with DB later.
+"""Postgres-backed user registry (email -> password_hash).
 
-Process-local only - not safe for multi-worker / multi-process deployments.
-For production, swap this for a real user table (Postgres / etc).
+Replaces the previous in-memory dict so registered users survive process
+restarts. Kept the same public API (is_registered / register / verify) so
+auth.py callers don't change.
 """
 
 from __future__ import annotations
 
 import hashlib
 
+from sqlalchemy import select
 
-class InMemoryUserStore:
-    def __init__(self) -> None:
-        self._users: dict[str, str] = {}
+from api.models.business import User
+from api.models.db import create_session
 
+
+class UserStore:
     def is_registered(self, email: str) -> bool:
-        return email in self._users
+        session = create_session()
+        try:
+            stmt = select(User.id).where(User.email == email).limit(1)
+            return session.exec(stmt).scalars().first() is not None
+        finally:
+            session.close()
 
     def register(self, email: str, password: str) -> None:
-        self._users[email] = self._hash(password)
+        session = create_session()
+        try:
+            session.add(User(email=email, password_hash=self._hash(password)))
+            session.commit()
+        finally:
+            session.close()
 
     def verify(self, email: str, password: str) -> bool:
-        stored = self._users.get(email)
-        if stored is None:
-            return False
-        return stored == self._hash(password)
+        session = create_session()
+        try:
+            stmt = select(User.password_hash).where(User.email == email).limit(1)
+            stored = session.exec(stmt).scalars().first()
+            if stored is None:
+                return False
+            return stored == self._hash(password)
+        finally:
+            session.close()
 
     @staticmethod
     def _hash(password: str) -> str:
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-_users = InMemoryUserStore()
+_user_store = UserStore()
 
 
-def get_user_store() -> InMemoryUserStore:
-    return _users
+def get_user_store() -> UserStore:
+    return _user_store

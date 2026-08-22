@@ -325,15 +325,35 @@ class AgentMessage(SQLModel, table=True):
     __tablename__ = "agent_messages"
     __table_args__ = (
         Index("ix_agent_messages_session_timestamp", "session_id", "timestamp"),
+        Index("ix_agent_messages_user_id", "user_id"),
         {"extend_existing": True},
     )
 
     id: int | None = Field(default=None, primary_key=True)
     session_id: str = Field(index=True, max_length=255, nullable=False)
+    user_id: str | None = Field(default=None, max_length=64)  # 登录用户（来自 JWT）
     role: str = Field(max_length=32, nullable=False)  # system | user | assistant | tool
     content: str | None = Field(default=None)
     tool_call_id: str | None = Field(default=None, max_length=128)
+    goods_name: str | None = Field(default=None, max_length=255)  # 仅首条 user 消息存
     timestamp: datetime = Field(default_factory=_now)
+
+
+# ── User (登录账号) ───────────────────────────────────────────────────
+
+
+class User(SQLModel, table=True):
+    __table_args__ = {"extend_existing": True}
+    __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_email", "email", unique=True),
+        {"extend_existing": True},
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    email: str = Field(max_length=255, nullable=False)
+    password_hash: str = Field(max_length=128, nullable=False)
+    created_at: datetime = Field(default_factory=_now)
 
 
 # ── OrderModel (订单 + 物流 — 3 表合一) ─────────────────────────────
