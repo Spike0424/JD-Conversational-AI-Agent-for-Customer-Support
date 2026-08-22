@@ -16,9 +16,16 @@ if TYPE_CHECKING:
     from api.core.request_state import RequestState, RequestTracker
 
 import openai
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
+
+import jieba
 from langchain_core.messages import ToolMessage, convert_to_messages
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+
+from api.core.embedding import get_embeddings
+from api.core.scene_classifier import _jd_pool_getconn
+from api.core.token_counter import count_tokens
 
 from api.core.config import get_settings
 from api.services.rag_logger import RAGLogger
@@ -97,6 +104,8 @@ class ReActQAAgent:
             model=self._settings.model_name,
             temperature=self._settings.temperature,
             request_timeout=self._settings.chat_timeout_seconds,
+            max_tokens=self._settings.chat_max_tokens,
+            stop=["\n---\n"],
             extra_body=_thinking_extra_body(self._settings),
         )
 
@@ -337,19 +346,77 @@ class ReActQAAgent:
     # ── Pre-warm ───────────────────────────────────────────────────────
 
     def prewarm(self) -> None:
+        """Warm everything the first chat request would otherwise touch cold.
+
+        Each step is bounded by an explicit timeout so a slow upstream never
+        stalls backend startup — if any step exceeds its budget we log and
+        move on; the lazy initializer for that step will run on first real
+        request.
+        """
         logger.info("Pre-warming agent …")
-        try:
-            from api.core.embedding import get_embeddings
-            get_embeddings()
-        except Exception as exc:
-            logger.warning("Embedding model pre-warm failed (will lazy-load on first use): %s", exc)
-        try:
-            from api.core.scene_classifier import _jd_pool_getconn, _jd_pool_putconn
-            conn = _jd_pool_getconn()
-            _jd_pool_putconn(conn)
-        except Exception as exc:
-            logger.warning("DB pool pre-warm failed: %s", exc)
+
+        # ── 1. Embedding model ─────────────────────────────
+        # Local model load can take a few seconds; cap at 30s.
+        self._run_with_timeout(
+            lambda: get_embeddings(),
+            seconds=30,
+            label="embedding model",
+        )
+        # ── 2. DB connection pool ──────────────────────────
+        self._run_with_timeout(
+            lambda: _jd_pool_getconn(),
+            seconds=5,
+            label="DB pool",
+        )
+        # ── 3. Token counter (tiktoken) ─────────────────────
+        self._run_with_timeout(
+            lambda: count_tokens(
+                [{"role": "user", "content": "hi"}],
+                self._settings.model_name,
+            ),
+            seconds=10,
+            label="token counter",
+        )
+        # ── 4. jieba dict ───────────────────────────────────
+        # Pure-CPU, no IO. 5s is generous.
+        self._run_with_timeout(
+            lambda: list(jieba.cut("预热", cut_all=False)),
+            seconds=5,
+            label="jieba",
+        )
+        # ── 5. LLM ping (TCP + auth warmup) ────────────────
+        self._run_with_timeout(
+            lambda: self._llm.invoke(
+                [{"role": "user", "content": "hi"}],
+                config={"max_tokens": 1, "temperature": 0, "timeout": 5},
+            ),
+            seconds=10,
+            label="LLM ping",
+        )
         logger.info("Agent pre-warm complete")
+
+    @staticmethod
+    def _run_with_timeout(fn, seconds: int, label: str) -> None:
+        """Run ``fn`` in a worker thread; hard-timeout after ``seconds``.
+
+        On timeout the orphan future is left running (Python can't kill
+        threads) but the lifespan is no longer blocked. Errors are logged
+        but never propagate, so one failed step doesn't abort the rest of
+        prewarm.
+        """
+        ex = ThreadPoolExecutor(max_workers=1)
+        try:
+            ex.submit(fn).result(timeout=seconds)
+        except _FuturesTimeout:
+            logger.warning("%s prewarm timed out (>%ds)", label, seconds)
+        except Exception as exc:
+            logger.warning("%s prewarm failed: %s", label, exc)
+        finally:
+            # DO NOT wait for orphan thread. With wait=True, an in-flight
+            # tiktoken HTTPS download or slow embedding load would block
+            # startup long past the timeout. Let the daemon thread finish
+            # in the background.
+            ex.shutdown(wait=False)
 
     # ── Core LLM call with single-round tool ──────────────────────────
 
@@ -427,7 +494,10 @@ class ReActQAAgent:
         """
         lc_messages = convert_to_messages(messages)
 
-        # Phase 1: 流式调用 llm_with_tools，缓冲文本 + 收集 tool_calls
+        # Phase 1: stream LLM with tools. Buffer text + collect tool_calls so we
+        # can either discard the "thinking" text (when a tool is called) or
+        # emit it verbatim (when no tool is needed). The frontend shows a
+        # "thinking..." placeholder while we wait.
         collected_tool_calls: list = []
         final_response: Any = None
         phase1_buffer: list[str] = []
@@ -442,7 +512,7 @@ class ReActQAAgent:
                         continue
                     text = self._extract_text(getattr(chunk, "content", ""))
                     if text:
-                        phase1_buffer.append(text)  # ← 缓冲，不 yield
+                        phase1_buffer.append(text)
                 elif kind == "on_chat_model_end":
                     final_response = event.get("data", {}).get("output")
                     if final_response:
@@ -453,12 +523,12 @@ class ReActQAAgent:
             return
 
         if not collected_tool_calls:
-            # LLM 没调工具：phase1_buffer 就是最终答案，逐段 yield
             for t in phase1_buffer:
                 yield t
             return
 
-        # Phase 2: 有 tool 调用，丢弃 phase1_buffer，并发 await 获取 context，再流式输出最终回答
+        # Phase 2: tool calls. Phase 1 buffer is discarded; the answer comes
+        # from the post-tool LLM call below.
         lc_messages.append(final_response)
         tool_outputs = await asyncio.gather(
             *(asyncio.to_thread(self._execute_tool_call, tc, tracker) for tc in collected_tool_calls)
@@ -547,6 +617,8 @@ class ReActQAAgent:
         scene: str = "",
         dependencies: dict | None = None,
         tracker: RequestTracker | None = None,
+        user_id: str | None = None,
+        goods_name: str | None = None,
     ) -> str:
         """Non-streaming chat turn with L1 retry and L2/L3 fallback.
 
@@ -588,8 +660,16 @@ class ReActQAAgent:
 
                 if tracker:
                     tracker.transition(_RS().LLM_GENERATING)
+                # Persist user message FIRST so DB row ordering matches
+                # the conversation: user, then assistant. Without this,
+                # normalize_answer below would land assistant at id=N and
+                # persist_user at id=N+1 — on refresh the history would
+                # render AI reply ABOVE the user question.
+                self._input_builder.persist_user(
+                    session_id, question, user_id=user_id, goods_name=goods_name,
+                )
                 raw_answer = await self._ainvoke_with_tools(messages, allow_tools=(attempt == 0), tracker=tracker)
-                answer = self._input_builder.normalize_answer(raw_answer, session_id)
+                answer = self._input_builder.normalize_answer(raw_answer, session_id, user_id=user_id)
                 answer = self._reject_if_leaked(answer, session_id, attempt + 1, is_stream=False)
 
                 if not answer:
@@ -605,7 +685,6 @@ class ReActQAAgent:
                         continue
                     break
 
-                self._input_builder.persist_user(session_id, question)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 logger.info(
                     "【LLM 输出】session=%s elapsed=%dms answer=%s",
@@ -614,7 +693,6 @@ class ReActQAAgent:
                 return answer
             except ClientError as exc:
                 logger.warning("ClientError, returning friendly message: %s", exc)
-                self._input_builder.persist_user(session_id, question)
                 return _CLIENT_ERROR_MESSAGE
             except Exception as exc:
                 last_err = exc
@@ -627,7 +705,8 @@ class ReActQAAgent:
                     await asyncio.sleep(delay)
 
         # ── Fallback path ──
-        self._input_builder.persist_user(session_id, question)
+        # User message already written at the top of the loop above; we only
+        # need to produce the fallback text.
         return self._resolve_fallback_answer(
             question=question, scene=scene, last_err=last_err, tracker=tracker, is_stream=False,
         )
@@ -641,6 +720,8 @@ class ReActQAAgent:
         scene: str = "",
         dependencies: dict | None = None,
         tracker: RequestTracker | None = None,
+        user_id: str | None = None,
+        goods_name: str | None = None,
     ) -> AsyncIterator[str]:
         """Streaming chat turn with L1 retry and L2/L3 fallback.
 
@@ -680,12 +761,17 @@ class ReActQAAgent:
                 answer_parts: list[str] = []
                 if tracker:
                     tracker.transition(_RS().LLM_GENERATING)
+                # Persist user message FIRST so row ordering matches
+                # user, then assistant.
+                self._input_builder.persist_user(
+                    session_id, question, user_id=user_id, goods_name=goods_name,
+                )
                 async for chunk in self._stream_with_tools(messages, tracker):
                     answer_parts.append(chunk)
                     yield chunk
 
                 answer = "".join(answer_parts).strip()
-                answer = self._input_builder.normalize_answer(answer, session_id)
+                answer = self._input_builder.normalize_answer(answer, session_id, user_id=user_id)
                 answer = self._reject_if_leaked(answer, session_id, attempt + 1, is_stream=True)
 
                 if not answer:
@@ -701,7 +787,6 @@ class ReActQAAgent:
                         continue
                     break
 
-                self._input_builder.persist_user(session_id, question)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 logger.info(
                     "【LLM 输出】session=%s elapsed=%dms answer=%s",
@@ -710,7 +795,6 @@ class ReActQAAgent:
                 return
             except ClientError as exc:
                 logger.warning("ClientError (stream), yielding friendly message: %s", exc)
-                self._input_builder.persist_user(session_id, question)
                 yield _CLIENT_ERROR_MESSAGE
                 return
             except Exception as exc:
@@ -724,7 +808,7 @@ class ReActQAAgent:
                     await asyncio.sleep(delay)
 
         # ── Fallback path ──
-        self._input_builder.persist_user(session_id, question)
+        # User message already written at the top of the loop above.
         yield self._resolve_fallback_answer(
             question=question, scene=scene, last_err=last_err, tracker=tracker, is_stream=True,
         )

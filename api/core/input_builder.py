@@ -388,14 +388,30 @@ class InputBuilder:
 
     # ── User messages persistence ─────────────────────────────────────
 
-    def persist_user(self, session_id: str, question: str) -> None:
+    def persist_user(
+        self,
+        session_id: str,
+        question: str,
+        user_id: str | None = None,
+        goods_name: str | None = None,
+    ) -> None:
         """Save the user message to the session store.
 
         args:
             session_id: conversation ID.
             question: user's raw message.
+            user_id: authenticated user (from JWT), scopes the message
+                to the sidebar history.
+            goods_name: only stamped on user-role rows so the sidebar can
+                show the conversation title.
         """
-        self._session_store.append(session_id=session_id, role="user", content=question)
+        self._session_store.append(
+            session_id=session_id,
+            role="user",
+            content=question,
+            user_id=user_id,
+            goods_name=goods_name,
+        )
 
     # ── Output normalization ──────────────────────────────────────────
 
@@ -403,12 +419,14 @@ class InputBuilder:
     def normalize_text(text: str) -> str:
         return re.sub(r"\s+", " ", text.strip())
 
-    def normalize_answer(self, raw: str, session_id: str) -> str:
+    def normalize_answer(self, raw: str, session_id: str, user_id: str | None = None) -> str:
         """Clean and validate the LLM answer (strip noise, persist).
 
         args:
             raw: raw LLM answer text.
             session_id: for persistence.
+            user_id: authenticated user (from JWT); assistant rows inherit it
+                so the message counts for sidebar ownership.
 
         returns: cleaned answer; "" if answer was noise/empty.
         """
@@ -427,6 +445,9 @@ class InputBuilder:
             return filtered
 
         self._session_store.append(
-            session_id=session_id, role="assistant", content=filtered,
+            session_id=session_id,
+            role="assistant",
+            content=filtered,
+            user_id=user_id,
         )
         return filtered
