@@ -26,9 +26,6 @@ Thumbs.db
 # Claude Code 本地/会话配置
 .claude/
 
-# Chainlit 缓存
-.chainlit/
-
 # Claude agent skills 缓存
 .agents/
 
