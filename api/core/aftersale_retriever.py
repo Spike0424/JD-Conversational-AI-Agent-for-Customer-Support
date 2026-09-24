@@ -7,6 +7,8 @@ Layer 2: pgvector cosine-distance search on aftersale_chunks → chunk_content
 import logging
 from typing import Any
 
+import numpy as np
+
 from sqlalchemy import text
 
 from api.models.db import create_session
@@ -27,7 +29,9 @@ class AftersaleRetriever:
             return []
 
         emb = get_embeddings()
-        query_vec = emb.embed_query(query)
+        # np.ndarray is required: pgvector's psycopg2 adapter only converts
+        # ndarrays to the vector literal; plain lists become numeric[].
+        query_vec = np.array(emb.embed_query(query), dtype=np.float32)
 
         session = create_session()
         try:

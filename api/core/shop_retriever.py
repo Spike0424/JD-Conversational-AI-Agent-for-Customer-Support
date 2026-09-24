@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
+
 from sqlalchemy import text
 
 from api.core.config import get_settings
@@ -35,7 +37,9 @@ class ShopSceneRetriever:
 
     def search(self, query: str) -> list[dict[str, Any]]:
         emb = get_embeddings()
-        query_vec = emb.embed_query(query)
+        # np.ndarray is required: pgvector's psycopg2 adapter only converts
+        # ndarrays to the vector literal; plain lists become numeric[].
+        query_vec = np.array(emb.embed_query(query), dtype=np.float32)
 
         session = create_session()
         try:

@@ -78,4 +78,5 @@ Form-first 流程：`ConsultationForm` 收集店铺/商品/订单号 -> `ChatRoo
 | Tune 3-tier API retry | `api/core/agent_runtime.py::_call_llm_ainvoke` + `api/core/retry.py` |
 | Tune message building / pre-RAG | `api/core/input_builder.py::_fill_db_placeholders` + `api/services/knowledge.py` `fetch_shop_advantages` |
 | Tune frontend UI | `web/src/components/*.tsx`（ChatRoom / ConsultationForm / MessageBubble） |
-| Add seed data | `scripts/seed_*.py` |
+| Add seed data / import docs | `util/import_docs.py`（PDF/MD → 知识库 + pgvector） |
+| Migrate embedding columns | `util/migrate_pgvector.py`（bytea → vector(512) + HNSW） |

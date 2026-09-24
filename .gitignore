@@ -44,11 +44,7 @@ datasheet/
 # Node（如果将来加前端）
 node_modules/
 
-# 售后政策文件
-doc/
-
-#md
-Readme.md
+docs/
 
 #test
 tests/

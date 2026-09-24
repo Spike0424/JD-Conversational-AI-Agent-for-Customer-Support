@@ -271,7 +271,7 @@ class SceneKnowledgeEmbedding(SQLModel, table=True):
     shop_id: int = Field(nullable=False)
     goods_id: int | None = Field(default=None)
     embedding_text: str = Field(nullable=False)
-    embedding: Any = Field(sa_column=Column(Vector(384), nullable=False))
+    embedding: Any = Field(sa_column=Column(Vector(512), nullable=False))
     embedding_model: str = Field(max_length=100, nullable=False)
     embedding_dim: int | None = Field(default=None)
     content_hash: str = Field(max_length=64, nullable=False)
@@ -313,7 +313,7 @@ class AftersaleChunk(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     knowledge_id: int = Field(foreign_key="aftersale_knowledge.id", nullable=False)
     chunk_content: str = Field(nullable=False)
-    embedding: Any = Field(default=None, sa_column=Column(Vector(384), nullable=True))
+    embedding: Any = Field(default=None, sa_column=Column(Vector(512), nullable=True))
     aliases: dict | None = Field(default=None, sa_column=Column(JSONB))
 
 
