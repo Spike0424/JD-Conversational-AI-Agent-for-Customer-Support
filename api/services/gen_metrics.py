@@ -323,10 +323,15 @@ def aggregate_generation(
         }
     n = len(results)
     noise_scores = [r.noise_sensitivity_score for r in results if r.noise_sensitivity_score is not None]
+
+    def _avg(field: str) -> float | None:
+        scores = [getattr(r, field) for r in results if getattr(r, field) is not None]
+        return sum(scores) / len(scores) if scores else None
+
     return {
-        "avg_faithfulness": sum(r.faithfulness_score for r in results) / n,
-        "avg_answer_relevance": sum(r.answer_relevance_score for r in results) / n,
-        "avg_context_usage": sum(r.context_usage_score for r in results) / n,
+        "avg_faithfulness": _avg("faithfulness_score"),
+        "avg_answer_relevance": _avg("answer_relevance_score"),
+        "avg_context_usage": _avg("context_usage_score"),
         "avg_noise_sensitivity": sum(noise_scores) / len(noise_scores) if noise_scores else None,
         "unparseable_metric_count": sum(r.unparseable_metric_count for r in results),
     }

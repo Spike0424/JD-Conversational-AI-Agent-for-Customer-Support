@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,6 +17,7 @@ from api.services.gen_metrics import (
 )
 from api.services.retrieval_metrics import normalize_docs
 from api.models.eval_schemas import GenerationEvalResult, RetrievedDoc
+from tests.conftest import run_async
 
 
 def _make_retrieved_docs(sources: list[str]) -> list[RetrievedDoc]:
@@ -265,3 +266,81 @@ class TestAggregateGeneration:
         agg = aggregate_generation(results)
         assert agg["avg_faithfulness"] == 3.0
         assert agg["avg_noise_sensitivity"] is None
+
+
+class TestAggregateGenerationWithNoneScores:
+    """Answers-only entries (no judge) carry None scores; aggregation must skip them."""
+
+    def test_mixed_none_scores_averaged_over_present_only(self):
+        scored = GenerationEvalResult(
+            query_id="q1",
+            faithfulness_score=5,
+            faithfulness_justification="ok",
+            answer_relevance_score=3,
+            answer_relevance_justification="ok",
+            context_usage_score=4,
+            context_usage_justification="ok",
+        )
+        answers_only = GenerationEvalResult(
+            query_id="q2",
+            faithfulness_score=None,
+            answer_relevance_score=None,
+            context_usage_score=None,
+        )
+        agg = aggregate_generation([scored, answers_only])
+        assert agg["avg_faithfulness"] == 5.0
+        assert agg["avg_answer_relevance"] == 3.0
+        assert agg["avg_context_usage"] == 4.0
+
+    def test_all_scores_none_returns_none_avgs(self):
+        answers_only = GenerationEvalResult(
+            query_id="q1",
+            faithfulness_score=None,
+            answer_relevance_score=None,
+            context_usage_score=None,
+        )
+        agg = aggregate_generation([answers_only])
+        assert agg["avg_faithfulness"] is None
+        assert agg["avg_answer_relevance"] is None
+        assert agg["avg_context_usage"] is None
+
+
+class TestEvalRunnerAnswersOnly:
+    """run_generation_eval=False still records agent answers in the report."""
+
+    def test_no_generation_mode_records_agent_answer(self, monkeypatch):
+        from api.models.eval_schemas import EvalQuery
+        from api.services import eval_runner as eval_runner_module
+        from api.services.eval_runner import EvalRunner
+
+        sk = MagicMock()
+        sk.count_relevant_documents.return_value = 3
+        sk.search_structured.return_value = [
+            {"id": 1, "source": "退货", "score": 100.0, "snippet": "s"}
+        ]
+        monkeypatch.setattr(eval_runner_module, "get_search_knowledge", lambda: sk)
+
+        runner = EvalRunner()
+        runner._scene_classifier = MagicMock()
+        runner._scene_classifier.classify = AsyncMock(return_value="aftersale")
+        runner._agent = MagicMock()
+        runner._agent.ask = AsyncMock(return_value="测试答案")
+
+        query = EvalQuery(
+            query_id="q1",
+            question="怎么退货",
+            relevant_source_patterns=["退货"],
+            ground_truth_answer="标准答案",
+        )
+        report = run_async(runner.run(
+            [query], dataset_name="t", k=2,
+            run_generation_eval=False, shop_id=1,
+        ))
+
+        gen = report.generation_details[0]
+        assert gen.agent_answer == "测试答案"
+        assert gen.ground_truth_answer == "标准答案"
+        assert gen.faithfulness_score is None
+        assert gen.answer_relevance_score is None
+        assert gen.context_usage_score is None
+        assert gen.noise_sensitivity_score is None

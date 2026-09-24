@@ -52,4 +52,8 @@ Readme.md
 
 #test
 tests/
-test-result/
+test-results/
+pngs/
+
+# eval 结果（golden 数据集 JSON）
+eval_results/

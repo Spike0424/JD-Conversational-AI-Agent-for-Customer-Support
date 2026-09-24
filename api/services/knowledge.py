@@ -19,6 +19,7 @@ from api.models.db import create_session
 from api.services.rag_logger import RAGLogger
 from api.core.aftersale_retriever import match_aftersale_exact
 from api.core.embedding import get_embeddings
+from api.services.retrieval_metrics import _is_relevant
 from util.agent_tool import agent_tool
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ _SCENE_TABLE = {
 _SCENE_NO_RETRIEVAL = {"mixed"}
 
 _VECTOR_MATCH_THRESHOLD = 0.45
+_FINAL_SCORE_THRESHOLD = 50
 _MATCH_TYPE_RULE = "rule"
 _MATCH_TYPE_HYBRID = "hybrid"
 _NON_WORD_RE = re.compile(r"[^\w]")
@@ -79,6 +81,8 @@ class SearchKnowledge:
         self._tracker = None
         self._shop_cache: dict[tuple[int, str], tuple[float, str]] = {}
         self._product_cache: dict[tuple[int, str, int], tuple[float, str]] = {}
+        # Observability: the search terms the last structured search consumed.
+        self.last_search_terms: list[str] = []
 
     def set_context(
         self, shop_id: int | str | None, scene: str = "presale",
@@ -238,6 +242,7 @@ class SearchKnowledge:
     def _fetch_candidates(
         self, shop_id: int, scene: str, goods_id: int | None,
         product_only: bool = False,
+        strict: bool = False,
     ) -> list[dict]:
         """Fetch knowledge entries. By default returns product-specific + shop-general
         when goods_id is given; pass product_only=True to exclude shop-general rows."""
@@ -279,9 +284,57 @@ class SearchKnowledge:
             return candidates
         except Exception:
             logger.exception("_fetch_candidates failed shop=%s scene=%s", shop_id, scene)
+            if strict:
+                raise
             return []
         finally:
             session.close()
+
+    def count_relevant_documents(self, patterns: list[str]) -> int:
+        """Count enabled DB knowledge rows matching any relevance pattern.
+
+        Uses the same shop/scene/goods candidate scope as online retrieval.
+        Each knowledge row is counted at most once, even when multiple patterns
+        match its aliases. Database failures are raised for evaluation callers.
+        """
+        if self._shop_id is None or self._scene in _SCENE_NO_RETRIEVAL:
+            return 0
+        candidates = self._fetch_candidates(
+            shop_id=self._shop_id,
+            scene=self._scene,
+            goods_id=self._goods_id,
+            strict=True,
+        )
+        seen_ids: set[int | str] = set()
+        relevant_count = 0
+        for entry in candidates:
+            document_id = entry.get("id")
+            if document_id is not None:
+                if document_id in seen_ids:
+                    continue
+                seen_ids.add(document_id)
+            if _is_relevant(entry.get("aliases", ""), patterns):
+                relevant_count += 1
+        return relevant_count
+
+    @staticmethod
+    def _deduplicate_ranked(ranked: list[dict]) -> list[dict]:
+        """Keep one result per database primary key; ranked order keeps best score."""
+        result: list[dict] = []
+        seen_ids: set[int | str] = set()
+        for entry in ranked:
+            document_id = entry.get("id")
+            if document_id is not None:
+                if document_id in seen_ids:
+                    continue
+                seen_ids.add(document_id)
+            result.append(entry)
+        return result
+
+    @staticmethod
+    def _apply_score_threshold(ranked: list[dict]) -> list[dict]:
+        """Keep only results strong enough to expose to the LLM."""
+        return [r for r in ranked if r["final_score"] >= _FINAL_SCORE_THRESHOLD]
 
     # ── prompt injection (pre-RAG) ─────────────────────────────────
 
@@ -471,6 +524,15 @@ class SearchKnowledge:
             self._tracker.transition(RequestState.RAG_RANKING, candidates=len(candidates))
         ranked = self._rank(query, candidates)
 
+        # ── Final-score threshold: drop weak matches so LLM never gets empty
+        # knowledge entries that would invite hallucination. With the current
+        # alias + keyword + vector scoring, legitimate hits score ≥ 50; anything
+        # below is noise from this query's perspective.
+        ranked = self._apply_score_threshold(self._deduplicate_ranked(ranked))
+        if not ranked:
+            label = _SCENE_LABELS.get(self._scene, self._scene)
+            return f"No {label} knowledge found for shop={self._shop_id} goods={self._goods_id}."
+
         # ── Format results for LLM (clean, no debug scores) ──
         lines: list[str] = []
         top_n = min(len(ranked), 2)
@@ -533,10 +595,17 @@ class SearchKnowledge:
         if not candidates:
             return []
 
-        ranked = self._rank(query, candidates)
+        # Layer 2 parity with the production search(): expand the query before
+        # ranking, and record the scoring terms so eval reports show what
+        # retrieval actually consumed.
+        expanded_query = self._contextual_complete(query)
+        self.last_search_terms = self._search_terms(expanded_query)
+
+        ranked = self._apply_score_threshold(self._deduplicate_ranked(self._rank(expanded_query, candidates)))
         results = []
         for r in ranked:
             results.append({
+                "id": r.get("id"),
                 "source": r.get("aliases", ""),
                 "score": r.get("final_score", 0),
                 "snippet": r.get("answer", "")[:300],

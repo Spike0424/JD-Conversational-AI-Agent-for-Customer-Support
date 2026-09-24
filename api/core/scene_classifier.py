@@ -227,10 +227,13 @@ class SceneClassifier:
         return ctx
 
     @staticmethod
-    def clear_cache(session_id: str | None = None) -> None:
+    def clear_cache(session_id: str | None = None) -> int:
+        """Clear cached scenes. Returns number of entries removed."""
         if session_id:
-            _SCENE_CACHE.pop(session_id, None)
+            removed = int(_SCENE_CACHE.pop(session_id, None) is not None)
             _SCENE_CACHE_TS.pop(session_id, None)
-        else:
-            _SCENE_CACHE.clear()
-            _SCENE_CACHE_TS.clear()
+            return removed
+        n = len(_SCENE_CACHE)
+        _SCENE_CACHE.clear()
+        _SCENE_CACHE_TS.clear()
+        return n
